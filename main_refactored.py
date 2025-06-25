@@ -26,6 +26,18 @@ from enum import Enum
 from playwright.sync_api import Page, sync_playwright, TimeoutError as PlaywrightTimeoutError
 import sys
 from pathlib import Path
+import requests
+from urllib.parse import urljoin, urlparse
+import hashlib
+
+# Adicionar import do openpyxl
+try:
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    import pandas as pd
+    EXCEL_SUPPORT = True
+except ImportError:
+    EXCEL_SUPPORT = False
 
 # ==========================================
 # CONFIGURAÇÕES E TIPOS
@@ -132,7 +144,7 @@ class LoggerConfig:
     """Configurador de logger centralizado"""
     
     @staticmethod
-    def setup_logger(name: str, level: LogLevel = LogLevel.WARNING) -> logging.Logger:
+    def setup_logger(name: str, level: LogLevel = LogLevel.INFO) -> logging.Logger:
         """Configura e retorna um logger"""
         logger = logging.getLogger(name)
         logger.setLevel(getattr(logging, level.value))
@@ -373,6 +385,24 @@ class ItemDataExtractor:
     def __init__(self, page: Page):
         self.page = page
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
+        self.downloads_dir = Path("downloads_anexos")
+        self.downloads_dir.mkdir(exist_ok=True)
+        self.session = requests.Session()
+        self.download_status_callback = None  # Callback para atualizar status de download
+        self._setup_session_headers()
+    
+    def _setup_session_headers(self):
+        """Configura headers para sessão de download"""
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin'
+        })
     
     def extract_all_items(self) -> List[ExtractedItemData]:
         """Extrai dados de todos os itens da página"""
@@ -382,6 +412,9 @@ class ItemDataExtractor:
             
             # Aguarda um pouco para a página carregar após clicar
             time.sleep(2)
+            
+            # Copia cookies do navegador para a sessão de download
+            self._copy_browser_cookies()
             
             # Depois expande os painéis
             orchestrator = PanelExpansionOrchestrator(self.page)
@@ -403,6 +436,21 @@ class ItemDataExtractor:
         except Exception as e:
             self.logger.error(f"Erro na extração: {str(e)}")
             return []
+    
+    def _copy_browser_cookies(self):
+        """Copia cookies do navegador para a sessão de download"""
+        try:
+            cookies = self.page.context.cookies()
+            for cookie in cookies:
+                self.session.cookies.set(
+                    name=cookie['name'],
+                    value=cookie['value'],
+                    domain=cookie.get('domain', ''),
+                    path=cookie.get('path', '/')
+                )
+            self.logger.info(f"Copiados {len(cookies)} cookies para sessão de download")
+        except Exception as e:
+            self.logger.warning(f"Erro ao copiar cookies: {str(e)}")
     
     def _click_insert_response_button(self) -> bool:
         """Verifica se existe botão 'inserir resposta' e clica nele se encontrar"""
@@ -527,24 +575,168 @@ class ItemDataExtractor:
         return text
     
     def _extract_attachments(self, form) -> str:
-        """Extrai arquivos anexados"""
+        """Extrai e baixa arquivos anexados, retornando caminhos locais"""
         try:
-            attachment_links = form.locator("a[href*='attachment'], a[href*='download']").all()
-            attachments = []
+            attachment_links = form.locator("a[href*='attachment'], a[href*='download'], a[href*='file']").all()
             
-            for link in attachment_links:
+            if not attachment_links:
+                return ""
+            
+            # Atualiza status se callback disponível
+            if self.download_status_callback:
+                self.download_status_callback(f"Encontrados {len(attachment_links)} anexos para baixar")
+            
+            downloaded_files = []
+            
+            for i, link in enumerate(attachment_links, 1):
                 try:
-                    text = link.text_content().strip()
                     href = link.get_attribute("href")
-                    attachments.append(text or href)
-                except Exception:
+                    if not href:
+                        continue
+                    
+                    # Obter nome do arquivo
+                    link_text = link.text_content().strip()
+                    
+                    # Atualiza status do download atual
+                    if self.download_status_callback:
+                        self.download_status_callback(f"Baixando anexo {i}/{len(attachment_links)}: {link_text}")
+                    
+                    # Se o href é relativo, torna absoluto
+                    if href.startswith('/'):
+                        full_url = urljoin(self.page.url, href)
+                    else:
+                        full_url = href
+                    
+                    # Baixa o arquivo
+                    local_path = self._download_file(full_url, link_text)
+                    
+                    if local_path:
+                        downloaded_files.append(str(local_path))
+                        self.logger.info(f"Arquivo baixado: {link_text} -> {local_path}")
+                        if self.download_status_callback:
+                            self.download_status_callback(f"✓ Anexo {i} baixado: {local_path.name}")
+                    else:
+                        # Se não conseguiu baixar, mantém informação do link
+                        downloaded_files.append(f"ERRO_DOWNLOAD: {link_text}")
+                        if self.download_status_callback:
+                            self.download_status_callback(f"✗ Erro ao baixar anexo {i}: {link_text}")
+                        
+                except Exception as e:
+                    self.logger.warning(f"Erro ao processar anexo: {str(e)}")
+                    if self.download_status_callback:
+                        self.download_status_callback(f"✗ Erro no anexo {i}: {str(e)}")
                     continue
             
-            return ", ".join(attachments)
+            if self.download_status_callback and downloaded_files:
+                self.download_status_callback(f"Downloads concluídos: {len([f for f in downloaded_files if not f.startswith('ERRO_DOWNLOAD')])}/{len(attachment_links)}")
+            
+            return "; ".join(downloaded_files)
             
         except Exception as e:
             self.logger.warning(f"Erro ao extrair anexos: {str(e)}")
             return ""
+    
+    def _download_file(self, url: str, suggested_name: str) -> Optional[Path]:
+        """Baixa um arquivo da URL e retorna o caminho local"""
+        try:
+            # Limita tempo de download
+            response = self.session.get(url, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # Determina nome do arquivo
+            filename = self._get_safe_filename(url, suggested_name, response)
+            
+            # Cria nome único se arquivo já existe
+            file_path = self.downloads_dir / filename
+            counter = 1
+            original_stem = file_path.stem
+            original_suffix = file_path.suffix
+            
+            while file_path.exists():
+                file_path = self.downloads_dir / f"{original_stem}_{counter}{original_suffix}"
+                counter += 1
+            
+            # Baixa o arquivo
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            # Verifica se o arquivo foi criado e tem conteúdo
+            if file_path.exists() and file_path.stat().st_size > 0:
+                return file_path
+            else:
+                self.logger.warning(f"Arquivo baixado está vazio: {file_path}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f"Erro de rede ao baixar {url}: {str(e)}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Erro ao baixar arquivo {url}: {str(e)}")
+            return None
+    
+    def _get_safe_filename(self, url: str, suggested_name: str, response) -> str:
+        """Gera nome de arquivo seguro"""
+        # Tenta obter nome do cabeçalho Content-Disposition
+        content_disposition = response.headers.get('content-disposition', '')
+        if 'filename=' in content_disposition:
+            try:
+                filename = content_disposition.split('filename=')[1].strip('"')
+                if filename and self._is_safe_filename(filename):
+                    return filename
+            except:
+                pass
+        
+        # Usa nome sugerido se válido
+        if suggested_name and self._is_safe_filename(suggested_name):
+            # Adiciona extensão se não tiver
+            if '.' not in suggested_name:
+                content_type = response.headers.get('content-type', '')
+                extension = self._get_extension_from_content_type(content_type)
+                if extension:
+                    suggested_name += extension
+            return suggested_name
+        
+        # Tenta extrair nome da URL
+        parsed_url = urlparse(url)
+        url_filename = Path(parsed_url.path).name
+        if url_filename and self._is_safe_filename(url_filename):
+            return url_filename
+        
+        # Gera nome baseado no hash da URL
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        content_type = response.headers.get('content-type', '')
+        extension = self._get_extension_from_content_type(content_type)
+        
+        return f"anexo_{url_hash}{extension}"
+    
+    def _is_safe_filename(self, filename: str) -> bool:
+        """Verifica se o nome do arquivo é seguro"""
+        if not filename:
+            return False
+        
+        # Remove caracteres perigosos
+        dangerous_chars = ['<', '>', ':', '"', '|', '?', '*', '\\', '/']
+        return not any(char in filename for char in dangerous_chars)
+    
+    def _get_extension_from_content_type(self, content_type: str) -> str:
+        """Retorna extensão baseada no Content-Type"""
+        content_type_map = {
+            'application/pdf': '.pdf',
+            'application/msword': '.doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.ms-excel': '.xls',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'text/plain': '.txt',
+            'application/zip': '.zip',
+            'application/x-rar-compressed': '.rar'
+        }
+        
+        return content_type_map.get(content_type.lower(), '.dat')
     
     def _is_valid_item(self, item: ExtractedItemData) -> bool:
         """Verifica se o item tem dados válidos"""
@@ -663,9 +855,7 @@ class DataExporter:
         
         try:
             # Remove duplicatas
-            original_count = len(data)
             filtered_data = self.duplicate_processor.remove_duplicates(data)
-            final_count = len(filtered_data)
             
             # Exporta para CSV
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
@@ -681,18 +871,106 @@ class DataExporter:
             self.logger.error(f"Erro ao exportar CSV: {str(e)}")
             return False
     
+    def export_to_excel(self, data: List[Dict[str, str]], filename: str) -> bool:
+        """Exporta dados para Excel com largura automática das colunas"""
+        if not data:
+            return False
+        
+        if not EXCEL_SUPPORT:
+            self.logger.warning("Bibliotecas Excel não instaladas. Salvando apenas CSV.")
+            return False
+        
+        try:
+            # Remove duplicatas
+            filtered_data = self.duplicate_processor.remove_duplicates(data)
+            
+            if not filtered_data:
+                return False
+            
+            # Converte para DataFrame
+            df = pd.DataFrame(filtered_data)
+            
+            # Cria o arquivo Excel
+            excel_filename = filename.replace('.csv', '.xlsx')
+            
+            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Cotações', index=False)
+                
+                # Obtém a planilha para ajuste de colunas
+                worksheet = writer.sheets['Cotações']
+                
+                # Ajusta largura das colunas baseado no conteúdo
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    
+                    for cell in column:
+                        try:
+                            # Considera o conteúdo da célula
+                            if cell.value:
+                                cell_length = len(str(cell.value))
+                                if cell_length > max_length:
+                                    max_length = cell_length
+                        except:
+                            pass
+                    
+                    # Define largura mínima e máxima
+                    adjusted_width = min(max(max_length + 2, 10), 80)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            self.logger.info(f"Arquivo Excel criado: {excel_filename}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao exportar Excel: {str(e)}")
+            return False
+    
+    def export_data(self, data: List[Dict[str, str]], base_filename: str) -> bool:
+        """Exporta dados em múltiplos formatos (CSV e Excel se disponível)"""
+        if not data:
+            return False
+        
+        try:
+            success_csv = self.export_to_csv(data, base_filename)
+            
+            # Tenta exportar para Excel também
+            success_excel = False
+            if EXCEL_SUPPORT:
+                success_excel = self.export_to_excel(data, base_filename)
+            
+            # Retorna True se pelo menos um formato foi exportado com sucesso
+            return success_csv or success_excel
+            
+        except Exception as e:
+            self.logger.error(f"Erro na exportação: {str(e)}")
+            return False
+    
     def get_export_summary(self, original_count: int, final_count: int, filename: str) -> str:
         """Gera resumo da exportação"""
         duplicates = original_count - final_count
+        
+        # Verifica quais arquivos foram criados
+        csv_file = filename
+        excel_file = filename.replace('.csv', '.xlsx')
+        
+        files_created = []
+        if os.path.exists(csv_file):
+            files_created.append("CSV")
+        if os.path.exists(excel_file):
+            files_created.append("Excel")
+        
+        files_text = " e ".join(files_created) if files_created else "CSV"
         
         if duplicates > 0:
             return (f"Exportação concluída!\n\n"
                    f"• {original_count} itens extraídos\n"
                    f"• {duplicates} duplicatas removidas\n"
-                   f"• {final_count} itens únicos salvos em {filename}")
+                   f"• {final_count} itens únicos salvos\n"
+                   f"• Formatos: {files_text}")
         else:
             return (f"Exportação concluída!\n\n"
-                   f"• {final_count} itens únicos salvos em {filename}\n"
+                   f"• {final_count} itens únicos salvos\n"
+                   f"• Formatos: {files_text}\n"
                    f"• Nenhuma duplicata detectada")
 
 # ==========================================
@@ -810,7 +1088,7 @@ class QuoteCrawler:
                     # Exportação
                     filename = self._generate_filename()
                     original_count = len(quotes_data)
-                    success = self.data_exporter.export_to_csv(quotes_data, filename)
+                    success = self.data_exporter.export_data(quotes_data, filename)
                     
                     if success:
                         # Verifica se o arquivo foi criado e tem conteúdo
@@ -933,6 +1211,9 @@ class QuoteCrawler:
         quotes_found_for_date = 0
         total_rows_checked = 0
         
+        # Log da data que estamos procurando
+        self.logger.info(f"Procurando cotações para a data: '{target_date}'")
+        
         # Configura timeout menor para detectar problemas rapidamente
         page.set_default_timeout(10000)  # 10 segundos em vez de 60
         
@@ -950,10 +1231,14 @@ class QuoteCrawler:
                 rows = page.locator("table tbody tr").all()
                 
                 if not rows:
+                    self.logger.warning("Nenhuma linha encontrada na tabela")
                     break
+                
+                self.logger.info(f"Encontradas {len(rows)} linhas na tabela para verificar")
                 
                 # Procura uma cotação não processada ainda
                 cotacao_encontrada = False
+                datas_encontradas = []  # Para log das datas que encontramos
                 
                 for i, row in enumerate(rows):
                     total_rows_checked += 1
@@ -966,14 +1251,26 @@ class QuoteCrawler:
                         # Extrai dados da cotação com timeout reduzido
                         quote_data = self._extract_quote_info_safe(row)
                         if not quote_data:
+                            self.logger.warning(f"Não foi possível extrair dados da linha {i+1}")
                             continue
                         
-                        # Verifica se a data corresponde
-                        if target_date not in quote_data["data_inicial"]:
+                        # Log da data encontrada para diagnóstico
+                        data_inicial = quote_data["data_inicial"]
+                        datas_encontradas.append(data_inicial)
+                        self.logger.info(f"Linha {i+1}: Evento '{quote_data['evento']}', Data inicial: '{data_inicial}'")
+                        
+                        # Verifica se a data corresponde usando múltiplas abordagens
+                        data_match = self._compare_dates(target_date, data_inicial)
+                        
+                        if not data_match:
+                            self.logger.info(f"Data '{data_inicial}' não corresponde à data alvo '{target_date}'")
                             continue
+                        
+                        self.logger.info(f"✓ Data correspondente encontrada: '{data_inicial}' para evento '{quote_data['evento']}'")
                         
                         # Verifica se já processamos esta cotação
                         if self._cotacao_ja_processada(quote_data['evento'], all_quotes_data):
+                            self.logger.info(f"Cotação '{quote_data['evento']}' já foi processada, pulando...")
                             continue
                         
                         quotes_found_for_date += 1
@@ -992,10 +1289,18 @@ class QuoteCrawler:
                         break
                         
                     except Exception as row_error:
+                        self.logger.warning(f"Erro ao processar linha {i+1}: {str(row_error)}")
                         continue
+                
+                # Log das datas encontradas nesta iteração
+                if datas_encontradas:
+                    self.logger.info(f"Datas encontradas nesta página: {datas_encontradas}")
+                else:
+                    self.logger.warning("Nenhuma data foi extraída das linhas da tabela")
                 
                 # Se não encontrou nenhuma cotação nova, para o processamento
                 if not cotacao_encontrada:
+                    self.logger.info("Nenhuma nova cotação encontrada, finalizando processamento")
                     break
                     
             except Exception as page_error:
@@ -1005,11 +1310,99 @@ class QuoteCrawler:
         # Restaura timeout original
         page.set_default_timeout(self.config.timeout_ms)
         
+        # Log final detalhado
+        self.logger.info(f"Processamento finalizado:")
+        self.logger.info(f"- Total de linhas verificadas: {total_rows_checked}")
+        self.logger.info(f"- Cotações encontradas para a data '{target_date}': {quotes_found_for_date}")
+        self.logger.info(f"- Cotações processadas com sucesso: {quotes_processed}")
+        self.logger.info(f"- Total de itens extraídos: {len(all_quotes_data)}")
+        
         # Log final apenas se não encontrou cotações
         if quotes_found_for_date == 0:
-            self.logger.warning(f"Nenhuma cotação encontrada para a data '{target_date}'")
+            self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}'")
         
         return all_quotes_data
+    
+    def _compare_dates(self, target_date: str, page_date: str) -> bool:
+        """Compara datas usando múltiplas abordagens para máxima compatibilidade"""
+        if not target_date or not page_date:
+            return False
+        
+        # Normaliza as strings
+        target_clean = target_date.strip()
+        page_clean = page_date.strip()
+        
+        # Abordagem 1: Comparação direta
+        if target_clean == page_clean:
+            return True
+        
+        # Abordagem 2: Substring (método original)
+        if target_clean in page_clean:
+            return True
+        
+        # Abordagem 3: Converte ambas para formato padrão DD/MM/YY
+        try:
+            target_normalized = self._normalize_date_format(target_clean)
+            page_normalized = self._normalize_date_format(page_clean)
+            
+            if target_normalized and page_normalized:
+                return target_normalized == page_normalized
+        except Exception as e:
+            self.logger.warning(f"Erro ao normalizar datas: {str(e)}")
+        
+        # Abordagem 4: Extrai apenas números e compara
+        target_numbers = re.findall(r'\d+', target_clean)
+        page_numbers = re.findall(r'\d+', page_clean)
+        
+        if len(target_numbers) >= 3 and len(page_numbers) >= 3:
+            # Compara dia, mês e ano
+            target_day, target_month, target_year = target_numbers[:3]
+            page_day, page_month, page_year = page_numbers[:3]
+            
+            # Normaliza anos (2 dígitos vs 4 dígitos)
+            if len(target_year) == 2:
+                target_year = "20" + target_year
+            if len(page_year) == 2:
+                page_year = "20" + page_year
+            
+            return (target_day == page_day and 
+                    target_month == page_month and 
+                    target_year == page_year)
+        
+        return False
+    
+    def _normalize_date_format(self, date_str: str) -> Optional[str]:
+        """Normaliza formato de data para DD/MM/YY"""
+        if not date_str:
+            return None
+        
+        # Remove espaços e caracteres especiais
+        clean_date = re.sub(r'[^\d/]', '', date_str)
+        
+        # Padrões suportados
+        patterns = [
+            r'^(\d{1,2})/(\d{1,2})/(\d{2})$',        # DD/MM/YY
+            r'^(\d{1,2})/(\d{1,2})/(\d{4})$',        # DD/MM/YYYY
+            r'^(\d{1,2})-(\d{1,2})-(\d{2})$',        # DD-MM-YY
+            r'^(\d{1,2})-(\d{1,2})-(\d{4})$',        # DD-MM-YYYY
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, clean_date)
+            if match:
+                day, month, year = match.groups()
+                
+                # Normaliza para 2 dígitos
+                day = day.zfill(2)
+                month = month.zfill(2)
+                
+                # Converte ano para 2 dígitos se necessário
+                if len(year) == 4:
+                    year = year[-2:]
+                
+                return f"{day}/{month}/{year}"
+        
+        return None
     
     def _extract_quote_info_safe(self, row) -> Optional[QuoteData]:
         """Extrai informações da cotação com tratamento de erro robusto"""
@@ -1078,6 +1471,12 @@ class QuoteCrawler:
             
             # Extrai itens da cotação
             extractor = ItemDataExtractor(page)
+            
+            # Configura callback para atualizar status durante downloads
+            def download_status_callback(message):
+                self._update_status(f"📎 {message}")
+            
+            extractor.download_status_callback = download_status_callback
             items = extractor.extract_all_items()
             
             if items:
