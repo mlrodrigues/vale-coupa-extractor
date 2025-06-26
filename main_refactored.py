@@ -382,14 +382,37 @@ class PanelExpansionOrchestrator:
 class ItemDataExtractor:
     """Extrator especializado em dados de itens"""
     
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, quote_id: str = None):
         self.page = page
+        self.quote_id = quote_id or "cotacao_geral"
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         self.downloads_dir = Path("downloads_anexos")
         self.downloads_dir.mkdir(exist_ok=True)
+        
+        # Cria pasta específica para esta cotação
+        self.quote_dir = self.downloads_dir / self._sanitize_folder_name(self.quote_id)
+        self.quote_dir.mkdir(exist_ok=True)
+        
         self.session = requests.Session()
         self.download_status_callback = None  # Callback para atualizar status de download
         self._setup_session_headers()
+    
+    def _sanitize_folder_name(self, folder_name: str) -> str:
+        """Sanitiza nome da pasta removendo caracteres inválidos"""
+        # Remove caracteres inválidos para nomes de pasta
+        invalid_chars = ['<', '>', ':', '"', '|', '?', '*', '\\', '/']
+        sanitized = folder_name
+        for char in invalid_chars:
+            sanitized = sanitized.replace(char, '_')
+        
+        # Remove espaços extras e substitui por underscore
+        sanitized = re.sub(r'\s+', '_', sanitized.strip())
+        
+        # Limita o tamanho do nome
+        if len(sanitized) > 100:
+            sanitized = sanitized[:100]
+        
+        return sanitized
     
     def _setup_session_headers(self):
         """Configura headers para sessão de download"""
@@ -607,7 +630,7 @@ class ItemDataExtractor:
                     else:
                         full_url = href
                     
-                    # Baixa o arquivo
+                    # Baixa o arquivo na pasta da cotação
                     local_path = self._download_file(full_url, link_text)
                     
                     if local_path:
@@ -646,17 +669,17 @@ class ItemDataExtractor:
             # Determina nome do arquivo
             filename = self._get_safe_filename(url, suggested_name, response)
             
-            # Cria nome único se arquivo já existe
-            file_path = self.downloads_dir / filename
+            # Cria nome único se arquivo já existe na pasta da cotação
+            file_path = self.quote_dir / filename
             counter = 1
             original_stem = file_path.stem
             original_suffix = file_path.suffix
             
             while file_path.exists():
-                file_path = self.downloads_dir / f"{original_stem}_{counter}{original_suffix}"
+                file_path = self.quote_dir / f"{original_stem}_{counter}{original_suffix}"
                 counter += 1
             
-            # Baixa o arquivo
+            # Baixa o arquivo diretamente na pasta da cotação
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
@@ -1470,7 +1493,7 @@ class QuoteCrawler:
             self._update_status(f"🔍 Extraindo itens da cotação {quote_data['evento']}...")
             
             # Extrai itens da cotação
-            extractor = ItemDataExtractor(page)
+            extractor = ItemDataExtractor(page, quote_data['evento'])
             
             # Configura callback para atualizar status durante downloads
             def download_status_callback(message):
