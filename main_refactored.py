@@ -110,6 +110,7 @@ class QuoteData(TypedDict):
     nome_evento: str
     data_inicial: str
     data_final: str
+    resposta: str  # Novo campo para filtrar cotações
 
 # ==========================================
 # INTERFACES E PROTOCOLOS
@@ -1012,18 +1013,25 @@ class AuthenticationService:
         try:
             # Navega para página de login
             login_url = f"{self.config.base_url}{self.config.login_path}"
-            page.goto(login_url)
-            time.sleep(2)
+            self.logger.info(f"Navegando para página de login: {login_url}")
+            
+            page.goto(login_url, wait_until='networkidle', timeout=30000)
+            time.sleep(3)
             
             # Verifica se está na página de login
             if not self._is_login_page(page):
                 self.logger.error("Não foi possível acessar a página de login")
+                self.logger.info(f"URL atual: {page.url}")
                 return False
             
+            self.logger.info("✅ Página de login carregada com sucesso")
+            
             # Preenche credenciais
+            self.logger.info("Preenchendo credenciais...")
             self._fill_credentials(page, username, password)
             
             # Submete formulário
+            self.logger.info("Submetendo formulário de login...")
             self._submit_login_form(page)
             
             # Verifica sucesso
@@ -1050,20 +1058,64 @@ class AuthenticationService:
     
     def _verify_authentication(self, page: Page) -> bool:
         """Verifica se a autenticação foi bem-sucedida"""
-        if "supplier_login" in page.url:
-            self.logger.error("Login falhou")
+        try:
+            # Verifica se ainda está na página de login
+            if "supplier_login" in page.url:
+                self.logger.error("Login falhou - ainda na página de login")
+                return False
+            
+            # Aguarda um pouco para garantir que a página carregou
+            time.sleep(3)
+            
+            # Log da URL atual para debug
+            current_url = page.url
+            self.logger.info(f"URL atual após login: {current_url}")
+            
+            # Verifica se está em uma página de erro ou redirecionamento
+            if "error" in current_url.lower() or "login" in current_url.lower():
+                self.logger.error(f"Login falhou - redirecionado para: {current_url}")
+                return False
+            
+            # Tenta acessar página de cotações
+            quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
+            self.logger.info(f"Tentando acessar: {quotes_url}")
+            
+            try:
+                page.goto(quotes_url, wait_until='networkidle', timeout=30000)
+                time.sleep(2)
+            except Exception as e:
+                self.logger.error(f"Erro ao navegar para página de cotações: {str(e)}")
+                return False
+            
+            # Verifica se conseguiu acessar a página
+            final_url = page.url
+            self.logger.info(f"URL final após navegação: {final_url}")
+            
+            # Verifica se está na página correta
+            success = "quote_supplier_land" in final_url
+            
+            if not success:
+                self.logger.error(f"Falha ao acessar página de cotações. URL final: {final_url}")
+                
+                # Tenta verificar se há mensagem de erro na página
+                try:
+                    error_elements = page.locator("text=error, text=Error, text=erro, text=Erro").all()
+                    if error_elements:
+                        for elem in error_elements[:3]:  # Primeiros 3 elementos de erro
+                            error_text = elem.text_content()
+                            if error_text:
+                                self.logger.error(f"Erro encontrado na página: {error_text}")
+                except:
+                    pass
+                
+                return False
+            
+            self.logger.info("✅ Autenticação bem-sucedida - página de cotações acessada")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro na verificação de autenticação: {str(e)}")
             return False
-        
-        # Tenta acessar página de cotações
-        quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
-        page.goto(quotes_url)
-        time.sleep(2)
-        
-        success = "quote_supplier_land" in page.url
-        if not success:
-            self.logger.error("Falha ao acessar página de cotações")
-        
-        return success
 
 # ==========================================
 # CRAWLER PRINCIPAL
@@ -1136,7 +1188,7 @@ class QuoteCrawler:
                         return False
                 else:
                     # Nenhum dado extraído - pode ser que não há cotações para a data
-                    self._update_status("❌ Nenhuma cotação encontrada")
+                    self._update_status("❌ Nenhuma cotação com resposta = 0 encontrada")
                     return False
                 
         except Exception as e:
@@ -1212,8 +1264,11 @@ class QuoteCrawler:
         # Configura visualização
         self._configure_page_view(page)
         
+        # Detecta posição da coluna resposta
+        resposta_column_index = self._find_resposta_column_index(page)
+        
         # Extrai cotações
-        return self._process_quote_rows(page, target_date)
+        return self._process_quote_rows(page, target_date, resposta_column_index)
     
     def _configure_page_view(self, page: Page) -> None:
         """Configura visualização da página (items per page, etc.)"""
@@ -1226,16 +1281,18 @@ class QuoteCrawler:
         except Exception as e:
             self.logger.warning(f"Não foi possível configurar visualização: {str(e)}")
     
-    def _process_quote_rows(self, page: Page, target_date: str) -> List[Dict[str, str]]:
+    def _process_quote_rows(self, page: Page, target_date: str, resposta_column_index: int) -> List[Dict[str, str]]:
         """Processa as linhas de cotações na tabela"""
         all_quotes_data = []
         
         quotes_processed = 0
         quotes_found_for_date = 0
+        quotes_filtered_by_response = 0  # Contador para cotações filtradas por resposta
         total_rows_checked = 0
         
         # Log da data que estamos procurando
         self.logger.info(f"Procurando cotações para a data: '{target_date}'")
+        self.logger.info(f"Filtrando apenas cotações com resposta = 0 (coluna {resposta_column_index})")
         
         # Configura timeout menor para detectar problemas rapidamente
         page.set_default_timeout(10000)  # 10 segundos em vez de 60
@@ -1272,15 +1329,24 @@ class QuoteCrawler:
                             continue
                         
                         # Extrai dados da cotação com timeout reduzido
-                        quote_data = self._extract_quote_info_safe(row)
+                        quote_data = self._extract_quote_info_safe(row, resposta_column_index)
                         if not quote_data:
+                            # Verifica se foi filtrado por resposta ou erro
+                            try:
+                                cells = row.locator("td")
+                                if cells.count() >= resposta_column_index + 1:
+                                    resposta_value = cells.nth(resposta_column_index).text_content(timeout=1000).strip()
+                                    if resposta_value and resposta_value != "0":
+                                        quotes_filtered_by_response += 1
+                            except:
+                                pass
                             self.logger.warning(f"Não foi possível extrair dados da linha {i+1}")
                             continue
                         
                         # Log da data encontrada para diagnóstico
                         data_inicial = quote_data["data_inicial"]
                         datas_encontradas.append(data_inicial)
-                        self.logger.info(f"Linha {i+1}: Evento '{quote_data['evento']}', Data inicial: '{data_inicial}'")
+                        self.logger.info(f"Linha {i+1}: Evento '{quote_data['evento']}', Data inicial: '{data_inicial}', Resposta: '{quote_data['resposta']}'")
                         
                         # Verifica se a data corresponde usando múltiplas abordagens
                         data_match = self._compare_dates(target_date, data_inicial)
@@ -1336,13 +1402,23 @@ class QuoteCrawler:
         # Log final detalhado
         self.logger.info(f"Processamento finalizado:")
         self.logger.info(f"- Total de linhas verificadas: {total_rows_checked}")
-        self.logger.info(f"- Cotações encontradas para a data '{target_date}': {quotes_found_for_date}")
+        self.logger.info(f"- Cotações filtradas por resposta ≠ 0: {quotes_filtered_by_response}")
+        self.logger.info(f"- Cotações encontradas para a data '{target_date}' (resposta = 0): {quotes_found_for_date}")
         self.logger.info(f"- Cotações processadas com sucesso: {quotes_processed}")
         self.logger.info(f"- Total de itens extraídos: {len(all_quotes_data)}")
         
         # Log final apenas se não encontrou cotações
         if quotes_found_for_date == 0:
-            self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}'")
+            if quotes_filtered_by_response > 0:
+                self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}' com resposta = 0")
+                self.logger.info(f"Encontradas {quotes_filtered_by_response} cotações com resposta ≠ 0 que foram filtradas")
+                self._update_status(f"⚠️ Nenhuma cotação com resposta = 0 encontrada para {target_date}")
+                self._update_status(f"📊 {quotes_filtered_by_response} cotações com resposta ≠ 0 foram filtradas")
+            else:
+                self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}'")
+                self._update_status(f"❌ Nenhuma cotação encontrada para {target_date}")
+        else:
+            self._update_status(f"✅ {quotes_found_for_date} cotações com resposta = 0 encontradas")
         
         return all_quotes_data
     
@@ -1427,13 +1503,14 @@ class QuoteCrawler:
         
         return None
     
-    def _extract_quote_info_safe(self, row) -> Optional[QuoteData]:
+    def _extract_quote_info_safe(self, row, resposta_column_index: int) -> Optional[QuoteData]:
         """Extrai informações da cotação com tratamento de erro robusto"""
         try:
             cells = row.locator("td")
             
-            # Verifica se há células suficientes
-            if cells.count() < 4:
+            # Verifica se há células suficientes (precisamos pelo menos da posição da coluna resposta + 1)
+            min_cells = max(5, resposta_column_index + 1)
+            if cells.count() < min_cells:
                 return None
             
             # Extrai com timeout reduzido
@@ -1446,11 +1523,22 @@ class QuoteCrawler:
             data_inicial = cells.nth(2).text_content(timeout=3000).strip()
             data_final = cells.nth(3).text_content(timeout=3000).strip()
             
+            # Extrai campo resposta usando o índice detectado
+            resposta = cells.nth(resposta_column_index).text_content(timeout=3000).strip()
+            
+            # Filtra apenas cotações com resposta = 0
+            if resposta != "0":
+                self.logger.info(f"Cotação '{evento}' ignorada - resposta = '{resposta}' (não é 0)")
+                return None
+            
+            self.logger.info(f"Cotação '{evento}' aceita - resposta = '{resposta}'")
+            
             return QuoteData(
                 evento=evento,
                 nome_evento=nome_evento,
                 data_inicial=data_inicial,
-                data_final=data_final
+                data_final=data_final,
+                resposta=resposta
             )
             
         except Exception as e:
@@ -1465,7 +1553,8 @@ class QuoteCrawler:
             evento=cells.nth(0).locator("a").text_content().strip(),
             nome_evento=cells.nth(1).text_content().strip(),
             data_inicial=cells.nth(2).text_content().strip(),
-            data_final=cells.nth(3).text_content().strip()
+            data_final=cells.nth(3).text_content().strip(),
+            resposta=cells.nth(6).text_content().strip()
         )
     
     def _cotacao_ja_processada(self, evento: str, dados_processados: List[Dict[str, str]]) -> bool:
@@ -1536,6 +1625,28 @@ class QuoteCrawler:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"dados_cotacoes_{timestamp}.csv"
 
+    def _find_resposta_column_index(self, page: Page) -> int:
+        """Encontra o índice da coluna 'resposta' na tabela"""
+        try:
+            # Procura pelos cabeçalhos da tabela
+            headers = page.locator("table thead tr th, table thead tr td").all()
+            
+            for i, header in enumerate(headers):
+                header_text = header.text_content().strip().lower()
+                
+                # Procura por diferentes variações do nome da coluna
+                if any(keyword in header_text for keyword in ['resposta', 'response', 'resp', 'status']):
+                    self.logger.info(f"Coluna 'resposta' encontrada na posição {i}: '{header_text}'")
+                    return i
+            
+            # Se não encontrou, assume que está na posição 4 (5ª coluna)
+            self.logger.warning("Coluna 'resposta' não encontrada nos cabeçalhos, usando posição padrão 4")
+            return 4
+            
+        except Exception as e:
+            self.logger.warning(f"Erro ao detectar coluna resposta: {str(e)}, usando posição padrão 4")
+            return 4
+
 # ==========================================
 # INTERFACE GRÁFICA
 # ==========================================
@@ -1590,7 +1701,7 @@ class CrawlerGUI:
         title = ttk.Label(header_frame, text="🔍 Extrator de Cotações Vale Coupa", style="Header.TLabel")
         title.pack(pady=10)
         
-        subtitle = ttk.Label(header_frame, text="Sistema automatizado para extração de dados de cotações", style="Info.TLabel")
+        subtitle = ttk.Label(header_frame, text="Sistema automatizado para extração de dados de cotações (apenas resposta = 0)", style="Info.TLabel")
         subtitle.pack()
     
     def _create_login_section(self, parent) -> None:
@@ -1723,11 +1834,11 @@ class CrawlerGUI:
             success = crawler.crawl_quotes(username, password, date)
             
             if success:
-                self.root.after(0, lambda: self.status_var.set("✅ Extração concluída!"))
+                self.root.after(0, lambda: self.status_var.set("✅ Extração concluída! (apenas resposta = 0)"))
                 self.root.after(0, lambda: self._show_success_and_close())
             else:
                 self.root.after(0, lambda: self.status_var.set("❌ Falha na extração"))
-                self.root.after(0, lambda: messagebox.showerror("Erro", "Falha na extração. Verifique se há cotações para a data informada."))
+                self.root.after(0, lambda: messagebox.showerror("Erro", "Falha na extração. Verifique se há cotações com resposta = 0 para a data informada."))
             
         except Exception as e:
             self.logger.error(f"Erro na thread de extração: {str(e)}")
@@ -1739,7 +1850,7 @@ class CrawlerGUI:
     
     def _show_success_and_close(self) -> None:
         """Mostra mensagem de sucesso e fecha a aplicação"""
-        result = messagebox.showinfo("Sucesso", "Extração realizada com sucesso!\n\nO arquivo CSV foi gerado na pasta do programa.")
+        result = messagebox.showinfo("Sucesso", "Extração realizada com sucesso!\n\nO arquivo CSV foi gerado na pasta do programa.\n\nNota: Apenas cotações com resposta = 0 foram extraídas.")
         # Fecha a aplicação após o usuário clicar OK
         self.root.quit()
         self.root.destroy()
