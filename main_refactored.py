@@ -93,6 +93,7 @@ class CrawlerConfig:
     headless: bool = True
     items_per_page: int = 90
     max_retries: int = 3
+    resposta_filter: str = "0"  # "0", "1", ou "todas"
     
 class ExtractedItemData(TypedDict):
     """Estrutura dos dados extraídos de um item"""
@@ -1136,9 +1137,12 @@ class QuoteCrawler:
         if self.status_callback:
             self.status_callback(message)
     
-    def crawl_quotes(self, username: str, password: str, target_date: str) -> bool:
+    def crawl_quotes(self, username: str, password: str, target_date: str, resposta_filter: str = "0") -> bool:
         """Executa o processo completo de crawling"""
         try:
+            # Configura o filtro de resposta
+            self.config.resposta_filter = resposta_filter
+            
             self._update_status("🌐 Iniciando browser...")
             
             with sync_playwright() as playwright:
@@ -1148,7 +1152,7 @@ class QuoteCrawler:
                 # Autenticação
                 self._update_status("🔐 Fazendo login...")
                 if not self.auth_service.authenticate(page, username, password):
-                    self._update_status("❌ Falha no login")
+                    self._update_status("❌ Falha no login - Credenciais inválidas")
                     return False
                 
                 self._update_status("📋 Buscando cotações...")
@@ -1188,7 +1192,12 @@ class QuoteCrawler:
                         return False
                 else:
                     # Nenhum dado extraído - pode ser que não há cotações para a data
-                    self._update_status("❌ Nenhuma cotação com resposta = 0 encontrada")
+                    if resposta_filter == "0":
+                        self._update_status("❌ Nenhuma cotação com resposta = 0 encontrada")
+                    elif resposta_filter == "1":
+                        self._update_status("❌ Nenhuma cotação com resposta ≠ 0 encontrada")
+                    else:
+                        self._update_status("❌ Nenhuma cotação encontrada")
                     return False
                 
         except Exception as e:
@@ -1284,6 +1293,7 @@ class QuoteCrawler:
     def _process_quote_rows(self, page: Page, target_date: str, resposta_column_index: int) -> List[Dict[str, str]]:
         """Processa as linhas de cotações na tabela"""
         all_quotes_data = []
+        eventos_processados = set()
         
         quotes_processed = 0
         quotes_found_for_date = 0
@@ -1292,7 +1302,14 @@ class QuoteCrawler:
         
         # Log da data que estamos procurando
         self.logger.info(f"Procurando cotações para a data: '{target_date}'")
-        self.logger.info(f"Filtrando apenas cotações com resposta = 0 (coluna {resposta_column_index})")
+        
+        # Log do filtro aplicado
+        if self.config.resposta_filter == "0":
+            self.logger.info(f"Filtrando apenas cotações com resposta = 0 (coluna {resposta_column_index})")
+        elif self.config.resposta_filter == "1":
+            self.logger.info(f"Filtrando apenas cotações com resposta ≠ 0 (coluna {resposta_column_index})")
+        else:
+            self.logger.info(f"Processando todas as cotações (coluna {resposta_column_index})")
         
         # Configura timeout menor para detectar problemas rapidamente
         page.set_default_timeout(10000)  # 10 segundos em vez de 60
@@ -1336,8 +1353,11 @@ class QuoteCrawler:
                                 cells = row.locator("td")
                                 if cells.count() >= resposta_column_index + 1:
                                     resposta_value = cells.nth(resposta_column_index).text_content(timeout=1000).strip()
-                                    if resposta_value and resposta_value != "0":
-                                        quotes_filtered_by_response += 1
+                                    if resposta_value:
+                                        if self.config.resposta_filter == "0" and resposta_value != "0":
+                                            quotes_filtered_by_response += 1
+                                        elif self.config.resposta_filter == "1" and resposta_value == "0":
+                                            quotes_filtered_by_response += 1
                             except:
                                 pass
                             self.logger.warning(f"Não foi possível extrair dados da linha {i+1}")
@@ -1358,7 +1378,7 @@ class QuoteCrawler:
                         self.logger.info(f"✓ Data correspondente encontrada: '{data_inicial}' para evento '{quote_data['evento']}'")
                         
                         # Verifica se já processamos esta cotação
-                        if self._cotacao_ja_processada(quote_data['evento'], all_quotes_data):
+                        if quote_data['evento'] in eventos_processados:
                             self.logger.info(f"Cotação '{quote_data['evento']}' já foi processada, pulando...")
                             continue
                         
@@ -1367,6 +1387,7 @@ class QuoteCrawler:
                         
                         # Processa esta cotação
                         sucesso = self._processar_cotacao_individual(page, row, quote_data, all_quotes_data)
+                        eventos_processados.add(quote_data['evento'])
                         
                         if sucesso:
                             quotes_processed += 1
@@ -1410,15 +1431,29 @@ class QuoteCrawler:
         # Log final apenas se não encontrou cotações
         if quotes_found_for_date == 0:
             if quotes_filtered_by_response > 0:
-                self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}' com resposta = 0")
-                self.logger.info(f"Encontradas {quotes_filtered_by_response} cotações com resposta ≠ 0 que foram filtradas")
-                self._update_status(f"⚠️ Nenhuma cotação com resposta = 0 encontrada para {target_date}")
-                self._update_status(f"📊 {quotes_filtered_by_response} cotações com resposta ≠ 0 foram filtradas")
+                if self.config.resposta_filter == "0":
+                    self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}' com resposta = 0")
+                    self.logger.info(f"Encontradas {quotes_filtered_by_response} cotações com resposta ≠ 0 que foram filtradas")
+                    self._update_status(f"⚠️ Nenhuma cotação com resposta = 0 encontrada para {target_date}")
+                    self._update_status(f"📊 {quotes_filtered_by_response} cotações com resposta ≠ 0 foram filtradas")
+                elif self.config.resposta_filter == "1":
+                    self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}' com resposta ≠ 0")
+                    self.logger.info(f"Encontradas {quotes_filtered_by_response} cotações com resposta = 0 que foram filtradas")
+                    self._update_status(f"⚠️ Nenhuma cotação com resposta ≠ 0 encontrada para {target_date}")
+                    self._update_status(f"📊 {quotes_filtered_by_response} cotações com resposta = 0 foram filtradas")
+                else:
+                    self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}'")
+                    self._update_status(f"⚠️ Nenhuma cotação encontrada para {target_date}")
             else:
                 self.logger.warning(f"NENHUMA cotação encontrada para a data '{target_date}'")
                 self._update_status(f"❌ Nenhuma cotação encontrada para {target_date}")
         else:
-            self._update_status(f"✅ {quotes_found_for_date} cotações com resposta = 0 encontradas")
+            if self.config.resposta_filter == "0":
+                self._update_status(f"✅ {quotes_found_for_date} cotações com resposta = 0 encontradas")
+            elif self.config.resposta_filter == "1":
+                self._update_status(f"✅ {quotes_found_for_date} cotações com resposta ≠ 0 encontradas")
+            else:
+                self._update_status(f"✅ {quotes_found_for_date} cotações encontradas")
         
         return all_quotes_data
     
@@ -1507,15 +1542,20 @@ class QuoteCrawler:
         """Extrai informações da cotação com tratamento de erro robusto"""
         try:
             cells = row.locator("td")
+            total_cells = cells.count()
+            
+            self.logger.info(f"Extraindo dados da linha - Total de células: {total_cells}, Coluna resposta: {resposta_column_index}")
             
             # Verifica se há células suficientes (precisamos pelo menos da posição da coluna resposta + 1)
             min_cells = max(5, resposta_column_index + 1)
-            if cells.count() < min_cells:
+            if total_cells < min_cells:
+                self.logger.warning(f"Células insuficientes: {total_cells} < {min_cells}")
                 return None
             
             # Extrai com timeout reduzido
             evento_link = cells.nth(0).locator("a")
             if evento_link.count() == 0:
+                self.logger.warning("Link do evento não encontrado")
                 return None
             
             evento = evento_link.text_content(timeout=3000).strip()
@@ -1526,10 +1566,20 @@ class QuoteCrawler:
             # Extrai campo resposta usando o índice detectado
             resposta = cells.nth(resposta_column_index).text_content(timeout=3000).strip()
             
-            # Filtra apenas cotações com resposta = 0
-            if resposta != "0":
-                self.logger.info(f"Cotação '{evento}' ignorada - resposta = '{resposta}' (não é 0)")
-                return None
+            self.logger.info(f"Dados extraídos - Evento: '{evento}', Data: '{data_inicial}', Resposta: '{resposta}'")
+            
+            # Aplica filtro baseado na configuração
+            if self.config.resposta_filter == "0":
+                # Filtra apenas cotações com resposta = 0
+                if resposta != "0":
+                    self.logger.info(f"Cotação '{evento}' ignorada - resposta = '{resposta}' (não é 0)")
+                    return None
+            elif self.config.resposta_filter == "1":
+                # Filtra apenas cotações com resposta ≠ 0
+                if resposta == "0":
+                    self.logger.info(f"Cotação '{evento}' ignorada - resposta = '{resposta}' (é 0)")
+                    return None
+            # Se resposta_filter == "todas", não filtra nada
             
             self.logger.info(f"Cotação '{evento}' aceita - resposta = '{resposta}'")
             
@@ -1626,26 +1676,8 @@ class QuoteCrawler:
         return f"dados_cotacoes_{timestamp}.csv"
 
     def _find_resposta_column_index(self, page: Page) -> int:
-        """Encontra o índice da coluna 'resposta' na tabela"""
-        try:
-            # Procura pelos cabeçalhos da tabela
-            headers = page.locator("table thead tr th, table thead tr td").all()
-            
-            for i, header in enumerate(headers):
-                header_text = header.text_content().strip().lower()
-                
-                # Procura por diferentes variações do nome da coluna
-                if any(keyword in header_text for keyword in ['resposta', 'response', 'resp', 'status']):
-                    self.logger.info(f"Coluna 'resposta' encontrada na posição {i}: '{header_text}'")
-                    return i
-            
-            # Se não encontrou, assume que está na posição 4 (5ª coluna)
-            self.logger.warning("Coluna 'resposta' não encontrada nos cabeçalhos, usando posição padrão 4")
-            return 4
-            
-        except Exception as e:
-            self.logger.warning(f"Erro ao detectar coluna resposta: {str(e)}, usando posição padrão 4")
-            return 4
+        # Força o índice da coluna resposta para 6
+        return 6
 
 # ==========================================
 # INTERFACE GRÁFICA
@@ -1663,129 +1695,64 @@ class CrawlerGUI:
         self._setup_ui()
     
     def _setup_ui(self) -> None:
-        """Configura a interface do usuário"""
         self.root.title("Vale Coupa Crawler - Versão Refatorada")
-        self.root.geometry("600x600")
+        self.root.minsize(600, 500)
+        self.root.geometry("700x600")
         self.root.configure(bg="#f8f9fa")
-        
-        # Estilo
-        self._configure_styles()
-        
-        # Container principal
-        main_frame = ttk.Frame(self.root, style="Card.TFrame")
-        main_frame.pack(padx=30, pady=30, fill="both", expand=True)
-        
-        # Componentes
-        self._create_header(main_frame)
-        self._create_login_section(main_frame)
-        self._create_date_section(main_frame)
-        self._create_action_section(main_frame)
-        self._create_status_section(main_frame)
-    
-    def _configure_styles(self) -> None:
-        """Configura estilos da interface"""
-        style = ttk.Style()
-        
-        # Cores modernas
-        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("Header.TLabel", background="#ffffff", font=("Segoe UI", 16, "bold"), foreground="#2c3e50")
-        style.configure("Section.TLabel", background="#ffffff", font=("Segoe UI", 11, "bold"), foreground="#34495e")
-        style.configure("Info.TLabel", background="#ffffff", font=("Segoe UI", 9), foreground="#7f8c8d")
-        style.configure("Status.TLabel", background="#ffffff", font=("Segoe UI", 10), foreground="#27ae60")
-    
-    def _create_header(self, parent) -> None:
-        """Cria cabeçalho da aplicação"""
-        header_frame = ttk.Frame(parent, style="Card.TFrame")
-        header_frame.pack(fill="x", pady=(0, 30))
-        
-        title = ttk.Label(header_frame, text="🔍 Extrator de Cotações Vale Coupa", style="Header.TLabel")
-        title.pack(pady=10)
-        
-        subtitle = ttk.Label(header_frame, text="Sistema automatizado para extração de dados de cotações (apenas resposta = 0)", style="Info.TLabel")
-        subtitle.pack()
-    
-    def _create_login_section(self, parent) -> None:
-        """Cria seção de login"""
-        login_frame = ttk.LabelFrame(parent, text="🔐 Credenciais de Acesso", style="Card.TFrame")
-        login_frame.pack(fill="x", pady=(0, 20))
-        
-        # Grid interno
-        grid_frame = ttk.Frame(login_frame)
-        grid_frame.pack(padx=20, pady=20, fill="x")
-        
-        # Usuário
-        ttk.Label(grid_frame, text="Usuário:", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # Cabeçalho
+        ttk.Label(main_frame, text="Extrator de Cotações Vale Coupa", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 5))
+        ttk.Label(main_frame, text="Sistema automatizado para extração de dados de cotações", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
+
+        # Linha 1: Login e Configurações lado a lado
+        row1 = ttk.Frame(main_frame)
+        row1.pack(fill="x", pady=(0, 10))
+
+        # Login
+        login_frame = ttk.LabelFrame(row1, text="Credenciais de Acesso")
+        login_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        ttk.Label(login_frame, text="Usuário (e-mail):").pack(anchor="w", padx=5, pady=(5, 0))
         self.username_var = tk.StringVar()
-        username_entry = ttk.Entry(grid_frame, textvariable=self.username_var, width=30, font=("Segoe UI", 10))
-        username_entry.grid(row=0, column=1, sticky="ew", pady=5)
-        
-        # Senha
-        ttk.Label(grid_frame, text="Senha:", style="Section.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(login_frame, textvariable=self.username_var).pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Label(login_frame, text="Senha:").pack(anchor="w", padx=5, pady=(0, 0))
         self.password_var = tk.StringVar()
-        password_entry = ttk.Entry(grid_frame, textvariable=self.password_var, show="*", width=30, font=("Segoe UI", 10))
-        password_entry.grid(row=1, column=1, sticky="ew", pady=5)
-        
-        grid_frame.columnconfigure(1, weight=1)
-    
-    def _create_date_section(self, parent) -> None:
-        """Cria seção de seleção de data"""
-        date_frame = ttk.LabelFrame(parent, text="📅 Data para Extração", style="Card.TFrame")
-        date_frame.pack(fill="x", pady=(0, 20))
-        
-        inner_frame = ttk.Frame(date_frame)
-        inner_frame.pack(padx=20, pady=20, fill="x")
-        
-        ttk.Label(inner_frame, text="Data (DD/MM/YY):", style="Section.TLabel").pack(anchor="w")
-        
-        date_input_frame = ttk.Frame(inner_frame)
-        date_input_frame.pack(anchor="w", pady=(5, 0))
-        
+        ttk.Entry(login_frame, textvariable=self.password_var, show="*").pack(fill="x", padx=5, pady=(0, 5))
+
+        # Configurações
+        config_frame = ttk.LabelFrame(row1, text="Configurações de Extração")
+        config_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        ttk.Label(config_frame, text="Data para Extração (DD/MM/YY):").pack(anchor="w", padx=5, pady=(5, 0))
         self.date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%y"))
-        date_entry = ttk.Entry(date_input_frame, textvariable=self.date_var, width=15, font=("Segoe UI", 10))
-        date_entry.pack(side="left")
-        
-        ttk.Label(date_input_frame, text="  Exemplo: 25/12/24", style="Info.TLabel").pack(side="left")
-    
-    def _create_action_section(self, parent) -> None:
-        """Cria seção de ações"""
-        action_frame = ttk.Frame(parent, style="Card.TFrame")
-        action_frame.pack(fill="x", pady=(0, 20))
-        
-        # Usando Button padrão do tkinter para melhor controle de aparência
-        self.extract_button = tk.Button(
-            action_frame, 
-            text="🔥 EXTRAIR COTAÇÕES", 
-            command=self._start_extraction,
-            bg="#007acc",  # Fundo azul
-            fg="white",    # Texto branco
-            font=("Segoe UI", 12, "bold"),
-            relief="flat", # Sem borda 3D
-            borderwidth=0, # Sem borda
-            padx=30,      # Padding horizontal
-            pady=15,      # Padding vertical
-            cursor="hand2", # Cursor de mão
-            activebackground="#005499", # Cor quando clicado
-            activeforeground="white"    # Texto quando clicado
-        )
-        self.extract_button.pack(pady=30)
-    
-    def _create_status_section(self, parent) -> None:
-        """Cria seção de status"""
-        status_frame = ttk.LabelFrame(parent, text="📊 Status", style="Card.TFrame")
-        status_frame.pack(fill="both", expand=True)
-        
+        ttk.Entry(config_frame, textvariable=self.date_var, width=12).pack(anchor="w", padx=5, pady=(0, 5))
+        ttk.Label(config_frame, text="Filtro de Resposta:").pack(anchor="w", padx=5, pady=(0, 0))
+        self.resposta_var = tk.StringVar(value="0")
+        ttk.Combobox(config_frame, textvariable=self.resposta_var, values=["0", "1", "todas"], width=10, state="readonly").pack(anchor="w", padx=5, pady=(0, 5))
+        ttk.Label(config_frame, text="0=Sem resposta, 1=Com resposta, todas=Todas", font=("Segoe UI", 8)).pack(anchor="w", padx=5, pady=(0, 5))
+
+        # Botão de ação
+        ttk.Separator(main_frame, orient="horizontal").pack(fill="x", pady=10)
+        self.extract_button = ttk.Button(main_frame, text="Extrair Cotações", command=self._start_extraction)
+        self.extract_button.pack(pady=(0, 10))
+
+        # Status
         self.status_var = tk.StringVar(value="Pronto para extrair cotações")
-        status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel")
-        status_label.pack(padx=20, pady=20, anchor="w")
+        ttk.Label(main_frame, textvariable=self.status_var, foreground="#228B22").pack(anchor="w", pady=(0, 5))
+
+        # Informações finais
+        ttk.Label(main_frame, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 0))
     
     def _start_extraction(self) -> None:
         """Inicia processo de extração"""
         username = self.username_var.get().strip()
         password = self.password_var.get().strip()
         date = self.date_var.get().strip()
+        resposta = self.resposta_var.get().strip()
         
         # Validações
-        if not self._validate_inputs(username, password, date):
+        if not self._validate_inputs(username, password, date, resposta):
             return
         
         # Atualiza UI
@@ -1797,12 +1764,12 @@ class CrawlerGUI:
         import threading
         thread = threading.Thread(
             target=self._execute_extraction,
-            args=(username, password, date),
+            args=(username, password, date, resposta),
             daemon=True
         )
         thread.start()
     
-    def _validate_inputs(self, username: str, password: str, date: str) -> bool:
+    def _validate_inputs(self, username: str, password: str, date: str, resposta: str) -> bool:
         """Valida entradas do usuário"""
         if not username or not password:
             messagebox.showerror("Erro", "Por favor, informe usuário e senha.")
@@ -1812,9 +1779,13 @@ class CrawlerGUI:
             messagebox.showerror("Erro", "Formato de data inválido. Use DD/MM/YY")
             return False
         
+        if resposta not in ["0", "1", "todas"]:
+            messagebox.showerror("Erro", "Resposta inválida. Use 0, 1 ou 'todas'.")
+            return False
+        
         return True
     
-    def _execute_extraction(self, username: str, password: str, date: str) -> None:
+    def _execute_extraction(self, username: str, password: str, date: str, resposta: str) -> None:
         """Executa a extração em thread separada"""
         try:
             # Atualiza status inicial
@@ -1831,14 +1802,29 @@ class CrawlerGUI:
             crawler.status_callback = update_status
             
             # Executa extração
-            success = crawler.crawl_quotes(username, password, date)
+            success = crawler.crawl_quotes(username, password, date, resposta)
             
             if success:
                 self.root.after(0, lambda: self.status_var.set("✅ Extração concluída! (apenas resposta = 0)"))
                 self.root.after(0, lambda: self._show_success_and_close())
             else:
-                self.root.after(0, lambda: self.status_var.set("❌ Falha na extração"))
-                self.root.after(0, lambda: messagebox.showerror("Erro", "Falha na extração. Verifique se há cotações com resposta = 0 para a data informada."))
+                # Verifica se o problema foi de login
+                if "❌ Falha no login" in self.status_var.get() or "Credenciais inválidas" in self.status_var.get():
+                    error_msg = "🔐 Erro de Autenticação!\n\nSuas credenciais de login estão incorretas ou sua conta pode estar bloqueada.\n\nPor favor, verifique:\n• Se o usuário está correto\n• Se a senha está correta\n• Se sua conta não está bloqueada\n• Se você tem acesso à plataforma Vale Coupa\n\nTente novamente com credenciais válidas."
+                    self.root.after(0, lambda: self.status_var.set("❌ Credenciais inválidas"))
+                else:
+                    self.root.after(0, lambda: self.status_var.set("❌ Falha na extração"))
+                    
+                    # Mensagem de erro dinâmica baseada no filtro
+                    resposta_filter = self.resposta_var.get()
+                    if resposta_filter == "0":
+                        error_msg = "Falha na extração. Verifique se há cotações sem resposta (resposta = 0) para a data informada."
+                    elif resposta_filter == "1":
+                        error_msg = "Falha na extração. Verifique se há cotações com resposta (resposta ≠ 0) para a data informada."
+                    else:
+                        error_msg = "Falha na extração. Verifique se há cotações para a data informada."
+                
+                self.root.after(0, lambda: messagebox.showerror("Erro", error_msg))
             
         except Exception as e:
             self.logger.error(f"Erro na thread de extração: {str(e)}")
@@ -1850,7 +1836,16 @@ class CrawlerGUI:
     
     def _show_success_and_close(self) -> None:
         """Mostra mensagem de sucesso e fecha a aplicação"""
-        result = messagebox.showinfo("Sucesso", "Extração realizada com sucesso!\n\nO arquivo CSV foi gerado na pasta do programa.\n\nNota: Apenas cotações com resposta = 0 foram extraídas.")
+        resposta_filter = self.resposta_var.get()
+        
+        if resposta_filter == "0":
+            filter_text = "apenas cotações sem resposta (resposta = 0)"
+        elif resposta_filter == "1":
+            filter_text = "apenas cotações com resposta (resposta ≠ 0)"
+        else:
+            filter_text = "todas as cotações"
+        
+        result = messagebox.showinfo("Sucesso", f"Extração realizada com sucesso!\n\nO arquivo CSV foi gerado na pasta do programa.\n\nNota: {filter_text} foram extraídas.")
         # Fecha a aplicação após o usuário clicar OK
         self.root.quit()
         self.root.destroy()

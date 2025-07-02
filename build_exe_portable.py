@@ -11,6 +11,7 @@ import shutil
 import platform
 from pathlib import Path
 import json
+from datetime import datetime
 
 class PortableBuilder:
     def __init__(self):
@@ -351,49 +352,63 @@ exe = EXE(
         # Garante que a pasta dist existe
         self.dist_dir.mkdir(parents=True, exist_ok=True)
         
-        readme_content = """# Vale Coupa Crawler v2 - Versão Portátil
+        readme_content = f"""# Vale Coupa Web Crawler - Versão Portátil
 
-## Sobre
-Este é o Vale Coupa Crawler em versão portátil v2. Não requer instalação - basta executar o arquivo.
+## 📋 Descrição
+Sistema automatizado para extração de dados de cotações da plataforma Vale Coupa com filtro de resposta configurável.
 
-## NOVIDADES v2
-- ✅ Filtro automático: Extrai apenas cotações com campo "resposta" = 0
-- ✅ Detecção automática da posição da coluna "resposta" na tabela
-- ✅ Logs detalhados mostrando quantas cotações foram filtradas
-- ✅ Interface atualizada indicando o filtro aplicado
+## 🚀 Como Usar
 
-## Como Usar
-1. Execute o arquivo `Vale_Coupa_Crawler_v2.exe`
-2. Digite suas credenciais de acesso
-3. Informe a data desejada (formato: DD/MM/YY)
-4. Clique em "EXTRAIR COTAÇÕES"
-5. O sistema automaticamente filtrará apenas cotações com resposta = 0
-6. Aguarde o processamento
-7. Os arquivos serão salvos na mesma pasta do executável
+### 1. Execução
+- Execute o arquivo `Vale_Coupa_Crawler.exe`
+- Aguarde a interface gráfica carregar
 
-## Arquivos Gerados
-- `dados_cotacoes_YYYYMMDD_HHMMSS.csv` - Dados em formato CSV
-- `dados_cotacoes_YYYYMMDD_HHMMSS.xlsx` - Dados em formato Excel (se disponível)
-- `downloads_anexos/` - Pasta com arquivos anexados das cotações
+### 2. Configuração
+- **Usuário**: Seu nome de usuário na plataforma Vale Coupa
+- **Senha**: Sua senha na plataforma Vale Coupa
+- **Data**: Data das cotações no formato DD/MM/YY (ex: 25/12/24)
+- **Filtro de Resposta**: 
+  - `0` = Apenas cotações sem resposta (resposta = 0)
+  - `1` = Apenas cotações com resposta (resposta ≠ 0)
+  - `todas` = Todas as cotações
 
-## Filtro de Resposta
-O sistema agora filtra automaticamente apenas cotações onde o campo "resposta" = 0.
-Cotações com resposta = 1 ou outros valores são ignoradas.
+### 3. Extração
+- Clique em "🔥 EXTRAIR COTAÇÕES"
+- Aguarde o processo de extração
+- O arquivo CSV será gerado na pasta do programa
 
-## Requisitos
-- Windows 10 ou superior
-- Conexão com internet
-- Credenciais válidas da plataforma Vale Coupa
+## 📁 Arquivos Gerados
+- `dados_cotacoes_YYYYMMDD_HHMMSS.csv` - Dados extraídos em formato CSV
+- `dados_cotacoes_YYYYMMDD_HHMMSS.xlsx` - Dados extraídos em formato Excel (se disponível)
+- `downloads_anexos/` - Pasta com anexos baixados das cotações
 
-## Suporte
+## 🔧 Funcionalidades
+- ✅ Autenticação automática na plataforma
+- ✅ Filtro configurável por tipo de resposta
+- ✅ Extração de dados de itens e serviços
+- ✅ Download automático de anexos
+- ✅ Remoção automática de duplicatas
+- ✅ Exportação para CSV e Excel
+- ✅ Interface gráfica moderna
+- ✅ Logs detalhados de execução
+
+## 📝 Notas Importantes
+- O sistema filtra automaticamente as cotações baseado no critério de resposta selecionado
+- Apenas cotações da data especificada são processadas
+- Os anexos são organizados em pastas por cotação
+- O arquivo de log `crawler.log` contém informações detalhadas da execução
+
+## 🆘 Suporte
 Em caso de problemas, verifique:
 1. Se as credenciais estão corretas
-2. Se há cotações para a data informada com resposta = 0
-3. Se a conexão com internet está funcionando
+2. Se há cotações para a data especificada
+3. Se há cotações com o tipo de resposta selecionado
+4. O arquivo de log para detalhes técnicos
 
-## Versão
-Gerado em: {data_atual}
-""".format(data_atual=__import__('datetime').datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+---
+**Versão**: Portátil com todas as dependências incluídas
+**Data**: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+"""
         
         readme_file = self.dist_dir / "README.txt"
         try:
