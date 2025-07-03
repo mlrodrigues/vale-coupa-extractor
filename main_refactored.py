@@ -1695,72 +1695,92 @@ class CrawlerGUI:
         self._setup_ui()
     
     def _setup_ui(self) -> None:
-        self.root.title("Vale Coupa Crawler - Versão Refatorada")
-        self.root.minsize(600, 500)
-        self.root.geometry("700x600")
-        self.root.configure(bg="#f8f9fa")
+        self.root.title("Extrator de Cotações Vale Coupa")
+        self.root.minsize(700, 600)
+        self.root.configure(bg="#fff")
 
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Card.TFrame", background="#fff", relief="flat", borderwidth=0)
+        style.configure("Card.TLabelframe", background="#fff", borderwidth=0)
+        style.configure("Card.TLabelframe.Label", background="#fff", font=("Segoe UI", 12, "bold"), foreground="#222")
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), foreground="#1a73e8", background="#fff")
+        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"), foreground="#222", background="#fff")
+        style.configure("TEntry", font=("Segoe UI", 11), fieldbackground="#fff", background="#fff", relief="flat")
+        style.configure("TCombobox", font=("Segoe UI", 11), fieldbackground="#fff", background="#fff", relief="flat")
+        style.configure("Accent.TButton", font=("Segoe UI", 12, "bold"), foreground="#fff", background="#22bb55", padding=8)
+        style.map("Accent.TButton",
+            background=[("active", "#1e9c47"), ("!active", "#22bb55")],
+            foreground=[("disabled", "#ccc"), ("!disabled", "#fff")]
+        )
 
         # Cabeçalho
-        ttk.Label(main_frame, text="Extrator de Cotações Vale Coupa", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 5))
-        ttk.Label(main_frame, text="Sistema automatizado para extração de dados de cotações", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
+        header = ttk.Frame(self.root, style="Card.TFrame")
+        header.pack(pady=(20, 10), padx=20, fill="x")
+        ttk.Label(header, text="📝 Extrator de Cotações Vale Coupa", style="Title.TLabel").pack(anchor="center")
+        ttk.Label(header, text="Sistema automatizado para extração de dados de cotações", font=("Segoe UI", 10), background="#fff").pack(anchor="center")
 
-        # Linha 1: Login e Configurações lado a lado
-        row1 = ttk.Frame(main_frame)
-        row1.pack(fill="x", pady=(0, 10))
+        # Card principal (inputs lado a lado)
+        main_card = ttk.Frame(self.root, style="Card.TFrame")
+        main_card.pack(padx=20, pady=10, fill="x")
 
-        # Login
-        login_frame = ttk.LabelFrame(row1, text="Credenciais de Acesso")
-        login_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        ttk.Label(login_frame, text="Usuário (e-mail):").pack(anchor="w", padx=5, pady=(5, 0))
+        # Inputs em grid
+        # Coluna 1: Credenciais
+        cred_frame = ttk.Labelframe(main_card, text="🔐 Credenciais de Acesso", style="Card.TLabelframe")
+        cred_frame.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="nsew")
+        cred_frame.columnconfigure(0, weight=1)
+        ttk.Label(cred_frame, text="Usuário (e-mail):", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         self.username_var = tk.StringVar()
-        ttk.Entry(login_frame, textvariable=self.username_var).pack(fill="x", padx=5, pady=(0, 5))
-        ttk.Label(login_frame, text="Senha:").pack(anchor="w", padx=5, pady=(0, 0))
+        ttk.Entry(cred_frame, textvariable=self.username_var, style="TEntry").grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(cred_frame, text="Senha:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
         self.password_var = tk.StringVar()
-        ttk.Entry(login_frame, textvariable=self.password_var, show="*").pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Entry(cred_frame, textvariable=self.password_var, show="*", style="TEntry").grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
 
-        # Configurações
-        config_frame = ttk.LabelFrame(row1, text="Configurações de Extração")
-        config_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        ttk.Label(config_frame, text="Data para Extração (DD/MM/YY):").pack(anchor="w", padx=5, pady=(5, 0))
+        # Coluna 2: Configurações
+        config_frame = ttk.Labelframe(main_card, text="⚙️ Configurações de Extração", style="Card.TLabelframe")
+        config_frame.grid(row=0, column=1, padx=(10, 0), pady=0, sticky="nsew")
+        config_frame.columnconfigure(1, weight=1)
+        ttk.Label(config_frame, text="Data para Extração:", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         self.date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%y"))
-        ttk.Entry(config_frame, textvariable=self.date_var, width=12).pack(anchor="w", padx=5, pady=(0, 5))
-        ttk.Label(config_frame, text="Filtro de Resposta:").pack(anchor="w", padx=5, pady=(0, 0))
-        self.resposta_var = tk.StringVar(value="0")
-        ttk.Combobox(config_frame, textvariable=self.resposta_var, values=["0", "1", "todas"], width=10, state="readonly").pack(anchor="w", padx=5, pady=(0, 5))
-        ttk.Label(config_frame, text="0=Sem resposta, 1=Com resposta, todas=Todas", font=("Segoe UI", 8)).pack(anchor="w", padx=5, pady=(0, 5))
+        ttk.Entry(config_frame, textvariable=self.date_var, width=14, style="TEntry").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(config_frame, text="Filtro de Resposta:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
+        self.resposta_var = tk.StringVar(value="Sem resposta")
+        self.resposta_map = {"Sem resposta": "0", "Com resposta": "1", "Todas": "todas"}
+        ttk.Combobox(config_frame, textvariable=self.resposta_var, values=["Sem resposta", "Com resposta", "Todas"], width=16, state="readonly", style="TCombobox").grid(row=3, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(config_frame, text="Escolha o tipo de cotação a extrair", font=("Segoe UI", 8), background="#fff").grid(row=4, column=0, sticky="w", padx=8, pady=(0, 8))
 
-        # Botão de ação
-        ttk.Separator(main_frame, orient="horizontal").pack(fill="x", pady=10)
-        self.extract_button = ttk.Button(main_frame, text="Extrair Cotações", command=self._start_extraction)
+        main_card.columnconfigure(0, weight=1)
+        main_card.columnconfigure(1, weight=1)
+
+        # Card de ação
+        action_card = ttk.Frame(self.root, style="Card.TFrame")
+        action_card.pack(padx=20, pady=(10, 0), fill="x")
+        ttk.Label(action_card, text="Iniciar Extração de Dados", style="Section.TLabel").pack(anchor="center", pady=(10, 5))
+        self.extract_button = ttk.Button(action_card, text="🚀 Extrair Cotações", style="Accent.TButton", command=self._start_extraction)
         self.extract_button.pack(pady=(0, 10))
+        ttk.Label(action_card, text="Clique no botão acima para iniciar a extração automática", font=("Segoe UI", 9), background="#fff").pack(anchor="center", pady=(0, 10))
 
-        # Status
+        # Card de status/logs
+        status_card = ttk.Labelframe(self.root, text="📊 Status e Logs", style="Card.TLabelframe")
+        status_card.pack(padx=20, pady=10, fill="x")
         self.status_var = tk.StringVar(value="Pronto para extrair cotações")
-        ttk.Label(main_frame, textvariable=self.status_var, foreground="#228B22").pack(anchor="w", pady=(0, 5))
-
-        # Informações finais
-        ttk.Label(main_frame, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 0))
+        ttk.Label(status_card, textvariable=self.status_var, foreground="#22bb55", font=("Segoe UI", 11, "bold"), background="#fff").pack(anchor="w", padx=8, pady=(8, 5))
+        ttk.Label(status_card, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8), background="#fff").pack(anchor="w", padx=8, pady=(0, 8))
     
     def _start_extraction(self) -> None:
-        """Inicia processo de extração"""
         username = self.username_var.get().strip()
         password = self.password_var.get().strip()
         date = self.date_var.get().strip()
-        resposta = self.resposta_var.get().strip()
-        
-        # Validações
+        resposta_legivel = self.resposta_var.get().strip()
+        resposta = self.resposta_map.get(resposta_legivel, "0")
+
         if not self._validate_inputs(username, password, date, resposta):
             return
-        
-        # Atualiza UI
+
         self.extract_button.config(state="disabled")
         self.status_var.set("🔄 Processando...")
         self.root.update()
-        
-        # Executa em thread separada
+
         import threading
         thread = threading.Thread(
             target=self._execute_extraction,
