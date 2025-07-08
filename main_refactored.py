@@ -132,10 +132,10 @@ class LoggerConfig:
     """Configurador de logger centralizado"""
     
     @staticmethod
-    def setup_logger(name: str, level: LogLevel = LogLevel.WARNING) -> logging.Logger:
+    def setup_logger(name: str, level: LogLevel = LogLevel.DEBUG) -> logging.Logger:
         """Configura e retorna um logger"""
         logger = logging.getLogger(name)
-        logger.setLevel(getattr(logging, level.value))
+        logger.setLevel(logging.DEBUG)
         
         if not logger.handlers:
             # Apenas file handler, sem console handler para não mostrar logs na tela
@@ -389,15 +389,16 @@ class ItemDataExtractor:
             
             # Conta itens válidos
             item_count = self._count_valid_items()
-            self.logger.info(f"Extraindo dados de {item_count} itens")
+            self.logger.debug(f"[COTAÇÃO] Itens detectados: {item_count}")
             
             items = []
             for i in range(item_count):
                 item_data = self._extract_single_item(i, item_count)
+                self.logger.debug(f"[COTAÇÃO] Extraindo item {i+1}/{item_count}: {item_data}")
                 if self._is_valid_item(item_data):
                     items.append(item_data)
             
-            self.logger.info(f"Extração concluída: {len(items)} itens válidos")
+            self.logger.debug(f"[COTAÇÃO] Total de itens extraídos: {len(items)}")
             return items
             
         except Exception as e:
@@ -450,15 +451,18 @@ class ItemDataExtractor:
             return False
     
     def _count_valid_items(self) -> int:
-        """Conta itens válidos na página"""
+        """Conta itens válidos na página (apenas forms visíveis e com descrição preenchida)"""
         return self.page.evaluate("""
             () => {
                 const forms = Array.from(document.querySelectorAll('form.s-itemsAndServicesFieldGrid'));
-                const validForms = forms.filter(form => {
+                return forms.filter(form => {
+                    // Verifica se o form está visível
                     const rect = form.getBoundingClientRect();
-                    return rect.height > 10 && rect.width > 10;
-                });
-                return validForms.length;
+                    if (rect.height < 10 || rect.width < 10) return false;
+                    // Verifica se tem texto de descrição
+                    const desc = form.querySelector('div.s-description p.s-textField');
+                    return desc && desc.textContent && desc.textContent.trim().length > 0;
+                }).length;
             }
         """)
     
@@ -655,30 +659,43 @@ class DataExporter:
     def __init__(self):
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         self.duplicate_processor = DuplicateProcessor()
-    
-    def export_to_csv(self, data: List[Dict[str, str]], filename: str) -> bool:
-        """Exporta dados para CSV com remoção automática de duplicatas"""
+
+    def export_to_excel(self, data: List[Dict[str, str]], filename: str) -> bool:
+        """Exporta dados para Excel (.xlsx) usando openpyxl puro (sem remover duplicatas)"""
         if not data:
             return False
-        
         try:
-            # Remove duplicatas
-            original_count = len(data)
-            filtered_data = self.duplicate_processor.remove_duplicates(data)
-            final_count = len(filtered_data)
-            
-            # Exporta para CSV
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                if filtered_data:
-                    fieldnames = filtered_data[0].keys()
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(filtered_data)
-            
+            from openpyxl import Workbook
+            # NÃO remove duplicatas!
+            filtered_data = data
+            # Cria workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Cotações"
+            # Cabeçalho
+            headers = list(filtered_data[0].keys())
+            ws.append(headers)
+            # Dados
+            for row in filtered_data:
+                ws.append([row.get(h, "") for h in headers])
+            # Ajusta largura das colunas
+            for col in ws.columns:
+                max_length = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 80)
+            # Salva arquivo
+            excel_filename = filename.replace('.csv', '.xlsx') if filename.endswith('.csv') else filename + '.xlsx'
+            wb.save(excel_filename)
+            self.logger.info(f"Arquivo Excel criado: {excel_filename}")
             return True
-            
         except Exception as e:
-            self.logger.error(f"Erro ao exportar CSV: {str(e)}")
+            self.logger.error(f"Erro ao exportar Excel: {str(e)}")
             return False
     
     def get_export_summary(self, original_count: int, final_count: int, filename: str) -> str:
@@ -787,57 +804,32 @@ class QuoteCrawler:
         """Executa o processo completo de crawling"""
         try:
             self._update_status("🌐 Iniciando browser...")
-            
             with sync_playwright() as playwright:
                 browser = self._create_browser(playwright)
                 page = self._create_page(browser)
-                
                 # Autenticação
                 self._update_status("🔐 Fazendo login...")
                 if not self.auth_service.authenticate(page, username, password):
                     self._update_status("❌ Falha no login")
                     return False
-                
                 self._update_status("📋 Buscando cotações...")
-                
                 # Extração de cotações
                 quotes_data = self._extract_quotes_for_date(page, target_date)
-                
-                # Se extraiu qualquer dado, considera sucesso
                 if quotes_data and len(quotes_data) > 0:
                     self._update_status("💾 Salvando dados...")
-                    
-                    # Exportação
                     filename = self._generate_filename()
                     original_count = len(quotes_data)
-                    success = self.data_exporter.export_to_csv(quotes_data, filename)
-                    
+                    # Salvar apenas em Excel
+                    success = self.data_exporter.export_to_excel(quotes_data, filename)
                     if success:
-                        # Verifica se o arquivo foi criado e tem conteúdo
-                        try:
-                            with open(filename, 'r', encoding='utf-8') as f:
-                                final_count = sum(1 for line in f) - 1  # -1 para descontar o cabeçalho
-                            
-                            # Se tem pelo menos 1 linha de dados, é sucesso
-                            if final_count > 0:
-                                self._update_status(f"✅ {final_count} itens salvos!")
-                                return True
-                            else:
-                                self.logger.error("Arquivo CSV criado mas está vazio!")
-                                self._update_status("❌ Nenhum dado extraído")
-                                return False
-                        except Exception:
-                            # Se não conseguir ler o arquivo, assume que deu erro
-                            self._update_status("❌ Erro ao salvar arquivo")
-                            return False
+                        self._update_status(f"✅ Dados salvos em Excel!")
+                        return True
                     else:
                         self._update_status("❌ Erro na exportação")
                         return False
                 else:
-                    # Nenhum dado extraído - pode ser que não há cotações para a data
                     self._update_status("❌ Nenhuma cotação encontrada")
                     return False
-                
         except Exception as e:
             self.logger.error(f"Erro no crawling: {str(e)}")
             self._update_status("❌ Erro inesperado")
