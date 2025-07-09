@@ -1122,24 +1122,77 @@ class CrawlerGUI:
         self._setup_ui()
     
     def _setup_ui(self) -> None:
-        """Configura a interface do usuário"""
-        self.root.title("Vale Coupa Crawler - Versão Refatorada")
-        self.root.geometry("600x600")
-        self.root.configure(bg="#f8f9fa")
-        
-        # Estilo
-        self._configure_styles()
-        
-        # Container principal
-        main_frame = ttk.Frame(self.root, style="Card.TFrame")
-        main_frame.pack(padx=30, pady=30, fill="both", expand=True)
-        
-        # Componentes
-        self._create_header(main_frame)
-        self._create_login_section(main_frame)
-        self._create_date_section(main_frame)
-        self._create_action_section(main_frame)
-        self._create_status_section(main_frame)
+        self.root.title("Extrator de Cotações Vale Coupa")
+        self.root.minsize(700, 600)
+        self.root.configure(bg="#fff")
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Card.TFrame", background="#fff", relief="flat", borderwidth=0)
+        style.configure("Card.TLabelframe", background="#fff", borderwidth=0)
+        style.configure("Card.TLabelframe.Label", background="#fff", font=("Segoe UI", 12, "bold"), foreground="#222")
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), foreground="#1a73e8", background="#fff")
+        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"), foreground="#222", background="#fff")
+        style.configure("TEntry", font=("Segoe UI", 11), fieldbackground="#fff", background="#fff", relief="flat")
+        style.configure("TCombobox", font=("Segoe UI", 11), fieldbackground="#fff", background="#fff", relief="flat")
+        style.configure("Accent.TButton", font=("Segoe UI", 12, "bold"), foreground="#fff", background="#22bb55", padding=8)
+        style.map("Accent.TButton",
+            background=[("active", "#1e9c47"), ("!active", "#22bb55")],
+            foreground=[("disabled", "#ccc"), ("!disabled", "#fff")]
+        )
+
+        # Cabeçalho
+        header = ttk.Frame(self.root, style="Card.TFrame")
+        header.pack(pady=(20, 10), padx=20, fill="x")
+        ttk.Label(header, text="📝 Extrator de Cotações Vale Coupa", style="Title.TLabel").pack(anchor="center")
+        ttk.Label(header, text="Sistema automatizado para extração de dados de cotações", font=("Segoe UI", 10), background="#fff").pack(anchor="center")
+
+        # Card principal (inputs lado a lado)
+        main_card = ttk.Frame(self.root, style="Card.TFrame")
+        main_card.pack(padx=20, pady=10, fill="x")
+
+        # Inputs em grid
+        # Coluna 1: Credenciais
+        cred_frame = ttk.Labelframe(main_card, text="🔐 Credenciais de Acesso", style="Card.TLabelframe")
+        cred_frame.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="nsew")
+        cred_frame.columnconfigure(0, weight=1)
+        ttk.Label(cred_frame, text="Usuário (e-mail):", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.username_var = tk.StringVar()
+        ttk.Entry(cred_frame, textvariable=self.username_var, style="TEntry").grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(cred_frame, text="Senha:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
+        self.password_var = tk.StringVar()
+        ttk.Entry(cred_frame, textvariable=self.password_var, show="*", style="TEntry").grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        # Coluna 2: Configurações
+        config_frame = ttk.Labelframe(main_card, text="⚙️ Configurações de Extração", style="Card.TLabelframe")
+        config_frame.grid(row=0, column=1, padx=(10, 0), pady=0, sticky="nsew")
+        config_frame.columnconfigure(1, weight=1)
+        ttk.Label(config_frame, text="Data para Extração:", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%y"))
+        ttk.Entry(config_frame, textvariable=self.date_var, width=14, style="TEntry").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(config_frame, text="Filtro de Resposta:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
+        self.resposta_var = tk.StringVar(value="Sem resposta")
+        self.resposta_map = {"Sem resposta": "0", "Com resposta": "1", "Todas": "todas"}
+        ttk.Combobox(config_frame, textvariable=self.resposta_var, values=["Sem resposta", "Com resposta", "Todas"], width=16, state="readonly", style="TCombobox").grid(row=3, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(config_frame, text="Escolha o tipo de cotação a extrair", font=("Segoe UI", 8), background="#fff").grid(row=4, column=0, sticky="w", padx=8, pady=(0, 8))
+
+        main_card.columnconfigure(0, weight=1)
+        main_card.columnconfigure(1, weight=1)
+
+        # Card de ação
+        action_card = ttk.Frame(self.root, style="Card.TFrame")
+        action_card.pack(padx=20, pady=(10, 0), fill="x")
+        ttk.Label(action_card, text="Iniciar Extração de Dados", style="Section.TLabel").pack(anchor="center", pady=(10, 5))
+        self.extract_button = ttk.Button(action_card, text="🚀 Extrair Cotações", style="Accent.TButton", command=self._start_extraction)
+        self.extract_button.pack(pady=(0, 10))
+        ttk.Label(action_card, text="Clique no botão acima para iniciar a extração automática", font=("Segoe UI", 9), background="#fff").pack(anchor="center", pady=(0, 10))
+
+        # Card de status/logs
+        status_card = ttk.Labelframe(self.root, text="📊 Status e Logs", style="Card.TLabelframe")
+        status_card.pack(padx=20, pady=10, fill="x")
+        self.status_var = tk.StringVar(value="Pronto para extrair cotações")
+        ttk.Label(status_card, textvariable=self.status_var, foreground="#22bb55", font=("Segoe UI", 11, "bold"), background="#fff").pack(anchor="w", padx=8, pady=(8, 5))
+        ttk.Label(status_card, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8), background="#fff").pack(anchor="w", padx=8, pady=(0, 8))
     
     def _configure_styles(self) -> None:
         """Configura estilos da interface"""
