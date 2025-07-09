@@ -727,25 +727,19 @@ class AuthenticationService:
     def authenticate(self, page: Page, username: str, password: str) -> bool:
         """Realiza autenticação na plataforma"""
         try:
-            # Navega para página de login
             login_url = f"{self.config.base_url}{self.config.login_path}"
             page.goto(login_url)
             time.sleep(2)
-            
-            # Verifica se está na página de login
             if not self._is_login_page(page):
                 self.logger.error("Não foi possível acessar a página de login")
                 return False
-            
-            # Preenche credenciais
             self._fill_credentials(page, username, password)
-            
-            # Submete formulário
             self._submit_login_form(page)
-            
             # Verifica sucesso
-            return self._verify_authentication(page)
-            
+            if not self._verify_authentication(page):
+                self.logger.error("Usuário ou senha incorretos!")
+                return "login_error"
+            return True
         except Exception as e:
             self.logger.error(f"Erro na autenticação: {str(e)}")
             return False
@@ -808,19 +802,19 @@ class QuoteCrawler:
             with sync_playwright() as playwright:
                 browser = self._create_browser(playwright)
                 page = self._create_page(browser)
-                # Autenticação
                 self._update_status("🔐 Fazendo login...")
-                if not self.auth_service.authenticate(page, username, password):
+                auth_result = self.auth_service.authenticate(page, username, password)
+                if auth_result == "login_error":
+                    self._update_status("❌ Usuário ou senha incorretos!")
+                    return "login_error"
+                if not auth_result:
                     self._update_status("❌ Falha no login")
                     return False
                 self._update_status("📋 Buscando cotações...")
-                # Extração de cotações
                 quotes_data = self._extract_quotes_for_date(page, target_date, resposta_filtro)
                 if quotes_data and len(quotes_data) > 0:
                     self._update_status("💾 Salvando dados...")
                     filename = self._generate_filename()
-                    original_count = len(quotes_data)
-                    # Salvar apenas em Excel
                     success = self.data_exporter.export_to_excel(quotes_data, filename)
                     if success:
                         self._update_status(f"✅ Dados salvos em Excel!")
@@ -1351,8 +1345,13 @@ class CrawlerGUI:
             def update_status(message):
                 self.root.after(0, lambda: self.status_var.set(message))
             crawler.status_callback = update_status
-            success = crawler.crawl_quotes(username, password, date, resposta_filtro)
-            if success:
+            result = crawler.crawl_quotes(username, password, date, resposta_filtro)
+            if result == "login_error":
+                self.root.after(0, lambda: self.status_var.set("❌ Usuário ou senha incorretos!"))
+                self.root.after(0, lambda: messagebox.showerror("Erro de Login", "Usuário ou senha incorretos! Por favor, tente novamente."))
+                self.root.after(0, lambda: self.extract_button.config(state="normal"))
+                return
+            if result:
                 self.root.after(0, lambda: self.status_var.set("✅ Extração concluída!"))
                 self.root.after(0, lambda: self._show_success_and_close())
             else:
