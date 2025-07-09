@@ -85,6 +85,7 @@ class CrawlerConfig:
 class ExtractedItemData(TypedDict):
     """Estrutura dos dados extraídos de um item"""
     numero_item: str
+    codigo_item: str  # Novo campo para o código extraído
     descricao: str
     descricao_estendida: str
     quantidade: str
@@ -95,6 +96,7 @@ class ExtractedItemData(TypedDict):
 class QuoteData(TypedDict):
     """Estrutura dos dados de uma cotação"""
     evento: str
+    numero_evento: str  # Novo campo para o número extraído
     nome_evento: str
     data_inicial: str
     data_final: str
@@ -471,17 +473,18 @@ class ItemDataExtractor:
         """Extrai dados de um item específico"""
         try:
             form = self.page.locator("form.s-itemsAndServicesFieldGrid").nth(index)
-            
+            raw_desc = self._extract_field("div.s-description p.s-textField", index)
+            codigo_item, descricao_sem_codigo = self._split_codigo_descricao(raw_desc)
             return ExtractedItemData(
                 numero_item=f"{index + 1}/{total}",
-                descricao=self._extract_field("div.s-description p.s-textField", index),
+                codigo_item=codigo_item,
+                descricao=descricao_sem_codigo,
                 descricao_estendida=self._extract_extended_description(index),
                 quantidade=self._extract_field("div.s-quantity span.s-value", index),
                 data_necessaria=self._extract_field("div.s-need_by_date p.s-textField", index),
                 detalhes=self._extract_field("div.s-details li span", index),
                 arquivos_anexados=self._extract_attachments(form)
             )
-            
         except Exception as e:
             self.logger.warning(f"Erro ao extrair item {index + 1}: {str(e)}")
             return self._create_empty_item(index, total)
@@ -555,10 +558,22 @@ class ItemDataExtractor:
         """Verifica se o item tem dados válidos"""
         return bool(item["descricao"] or item["quantidade"] or item["descricao_estendida"])
     
+    def _split_codigo_descricao(self, raw_desc: str) -> (str, str):
+        """Separa o código do início da descrição (antes do primeiro '||')"""
+        if not raw_desc:
+            return "", ""
+        partes = raw_desc.split('||', 1)
+        if len(partes) == 2:
+            codigo = partes[0].strip()
+            descricao = partes[1].strip()
+            return codigo, descricao
+        return "", raw_desc.strip()
+    
     def _create_empty_item(self, index: int, total: int) -> ExtractedItemData:
         """Cria item vazio em caso de erro"""
         return ExtractedItemData(
             numero_item=f"{index + 1}/{total}",
+            codigo_item="",
             descricao="",
             descricao_estendida="",
             quantidade="",
@@ -1010,33 +1025,38 @@ class QuoteCrawler:
         """Extrai informações da cotação com tratamento de erro robusto"""
         try:
             cells = row.locator("td")
-            
-            # Verifica se há células suficientes
             if cells.count() < 7:
                 return None
-            
-            # Extrai com timeout reduzido
             evento_link = cells.nth(0).locator("a")
             if evento_link.count() == 0:
                 return None
-            
             evento = evento_link.text_content(timeout=3000).strip()
-            nome_evento = cells.nth(1).text_content(timeout=3000).strip()
+            raw_nome_evento = cells.nth(1).text_content(timeout=3000).strip()
+            numero_evento, nome_evento_limpo = self._split_numero_nome_evento(raw_nome_evento)
             data_inicial = cells.nth(2).text_content(timeout=3000).strip()
             data_final = cells.nth(3).text_content(timeout=3000).strip()
             resposta = cells.nth(6).text_content(timeout=3000).strip()
-            
             return QuoteData(
                 evento=evento,
-                nome_evento=nome_evento,
+                numero_evento=numero_evento,
+                nome_evento=nome_evento_limpo,
                 data_inicial=data_inicial,
                 data_final=data_final,
                 resposta=resposta
             )
-            
         except Exception as e:
             self.logger.warning(f"Erro ao extrair dados da linha: {str(e)}")
             return None
+    def _split_numero_nome_evento(self, raw_nome_evento: str) -> (str, str):
+        """Separa o número do nome do evento (após o '#')"""
+        if not raw_nome_evento:
+            return "", ""
+        match = re.search(r'#(\d+)', raw_nome_evento)
+        if match:
+            numero = match.group(1)
+            nome_limpo = re.sub(r'#\d+', '', raw_nome_evento).strip()
+            return numero, nome_limpo
+        return "", raw_nome_evento.strip()
     
     def _extract_quote_info(self, row) -> QuoteData:
         """Extrai informações básicas da cotação da linha da tabela (método original para compatibilidade)"""
