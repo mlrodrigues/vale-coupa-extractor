@@ -98,6 +98,7 @@ class QuoteData(TypedDict):
     nome_evento: str
     data_inicial: str
     data_final: str
+    resposta: str  # Adicionado campo resposta
 
 # ==========================================
 # INTERFACES E PROTOCOLOS
@@ -800,7 +801,7 @@ class QuoteCrawler:
         if self.status_callback:
             self.status_callback(message)
     
-    def crawl_quotes(self, username: str, password: str, target_date: str) -> bool:
+    def crawl_quotes(self, username: str, password: str, target_date: str, resposta_filtro: str = "todas") -> bool:
         """Executa o processo completo de crawling"""
         try:
             self._update_status("🌐 Iniciando browser...")
@@ -814,7 +815,7 @@ class QuoteCrawler:
                     return False
                 self._update_status("📋 Buscando cotações...")
                 # Extração de cotações
-                quotes_data = self._extract_quotes_for_date(page, target_date)
+                quotes_data = self._extract_quotes_for_date(page, target_date, resposta_filtro)
                 if quotes_data and len(quotes_data) > 0:
                     self._update_status("💾 Salvando dados...")
                     filename = self._generate_filename()
@@ -895,7 +896,7 @@ class QuoteCrawler:
         
         return page
     
-    def _extract_quotes_for_date(self, page: Page, target_date: str) -> List[Dict[str, str]]:
+    def _extract_quotes_for_date(self, page: Page, target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
         """Extrai cotações para data específica"""
         quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
         page.goto(quotes_url)
@@ -904,7 +905,7 @@ class QuoteCrawler:
         self._configure_page_view(page)
         
         # Extrai cotações
-        return self._process_quote_rows(page, target_date)
+        return self._process_quote_rows(page, target_date, resposta_filtro)
     
     def _configure_page_view(self, page: Page) -> None:
         """Configura visualização da página (items per page, etc.)"""
@@ -917,8 +918,8 @@ class QuoteCrawler:
         except Exception as e:
             self.logger.warning(f"Não foi possível configurar visualização: {str(e)}")
     
-    def _process_quote_rows(self, page: Page, target_date: str) -> List[Dict[str, str]]:
-        """Processa as linhas de cotações na tabela"""
+    def _process_quote_rows(self, page: Page, target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
+        """Processa as linhas de cotações na tabela, aplicando filtro de resposta"""
         all_quotes_data = []
         
         quotes_processed = 0
@@ -960,8 +961,16 @@ class QuoteCrawler:
                         if not quote_data:
                             continue
                         
-                        # Verifica se a data corresponde
+                        # Filtro de data
                         if target_date not in quote_data["data_inicial"]:
+                            continue
+                        
+                        # Filtro de resposta (coluna 6)
+                        resposta_valor = self._extract_resposta_coluna(row)
+                        quote_data["resposta"] = resposta_valor
+                        if resposta_filtro == "0" and resposta_valor != "0":
+                            continue
+                        if resposta_filtro == "1" and resposta_valor == "0":
                             continue
                         
                         # Verifica se já processamos esta cotação
@@ -1009,7 +1018,7 @@ class QuoteCrawler:
             cells = row.locator("td")
             
             # Verifica se há células suficientes
-            if cells.count() < 4:
+            if cells.count() < 7:
                 return None
             
             # Extrai com timeout reduzido
@@ -1021,12 +1030,14 @@ class QuoteCrawler:
             nome_evento = cells.nth(1).text_content(timeout=3000).strip()
             data_inicial = cells.nth(2).text_content(timeout=3000).strip()
             data_final = cells.nth(3).text_content(timeout=3000).strip()
+            resposta = cells.nth(6).text_content(timeout=3000).strip()
             
             return QuoteData(
                 evento=evento,
                 nome_evento=nome_evento,
                 data_inicial=data_inicial,
-                data_final=data_final
+                data_final=data_final,
+                resposta=resposta
             )
             
         except Exception as e:
@@ -1043,6 +1054,16 @@ class QuoteCrawler:
             data_inicial=cells.nth(2).text_content().strip(),
             data_final=cells.nth(3).text_content().strip()
         )
+    
+    def _extract_resposta_coluna(self, row) -> str:
+        """Extrai o valor da coluna de resposta (índice 6) da linha da tabela"""
+        try:
+            cells = row.locator("td")
+            if cells.count() >= 7:
+                return cells.nth(6).text_content(timeout=3000).strip()
+            return ""
+        except Exception:
+            return ""
     
     def _cotacao_ja_processada(self, evento: str, dados_processados: List[Dict[str, str]]) -> bool:
         """Verifica se uma cotação já foi processada"""
@@ -1295,21 +1316,17 @@ class CrawlerGUI:
         username = self.username_var.get().strip()
         password = self.password_var.get().strip()
         date = self.date_var.get().strip()
-        
-        # Validações
+        resposta_legivel = self.resposta_var.get().strip()
+        resposta_filtro = self.resposta_map.get(resposta_legivel, "todas")
         if not self._validate_inputs(username, password, date):
             return
-        
-        # Atualiza UI
         self.extract_button.config(state="disabled")
         self.status_var.set("🔄 Processando...")
         self.root.update()
-        
-        # Executa em thread separada
         import threading
         thread = threading.Thread(
             target=self._execute_extraction,
-            args=(username, password, date),
+            args=(username, password, date, resposta_filtro),
             daemon=True
         )
         thread.start()
@@ -1326,37 +1343,25 @@ class CrawlerGUI:
         
         return True
     
-    def _execute_extraction(self, username: str, password: str, date: str) -> None:
+    def _execute_extraction(self, username: str, password: str, date: str, resposta_filtro: str) -> None:
         """Executa a extração em thread separada"""
         try:
-            # Atualiza status inicial
             self.root.after(0, lambda: self.status_var.set("🔐 Conectando..."))
-            
-            # Cria um crawler com callback de status
             crawler = QuoteCrawler(self.config)
-            
-            # Define callback para atualizações de status
             def update_status(message):
                 self.root.after(0, lambda: self.status_var.set(message))
-            
-            # Adiciona callback ao crawler
             crawler.status_callback = update_status
-            
-            # Executa extração
-            success = crawler.crawl_quotes(username, password, date)
-            
+            success = crawler.crawl_quotes(username, password, date, resposta_filtro)
             if success:
                 self.root.after(0, lambda: self.status_var.set("✅ Extração concluída!"))
                 self.root.after(0, lambda: self._show_success_and_close())
             else:
                 self.root.after(0, lambda: self.status_var.set("❌ Falha na extração"))
                 self.root.after(0, lambda: messagebox.showerror("Erro", "Falha na extração. Verifique se há cotações para a data informada."))
-            
         except Exception as e:
             self.logger.error(f"Erro na thread de extração: {str(e)}")
             self.root.after(0, lambda: self.status_var.set("❌ Erro inesperado"))
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro inesperado: {str(e)}"))
-        
         finally:
             self.root.after(0, lambda: self.extract_button.config(state="normal"))
     
