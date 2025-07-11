@@ -26,6 +26,7 @@ from enum import Enum
 from playwright.sync_api import Page, sync_playwright, TimeoutError as PlaywrightTimeoutError
 import sys
 from pathlib import Path
+import requests
 
 # ==========================================
 # CONFIGURAÇÕES E TIPOS
@@ -373,9 +374,12 @@ class PanelExpansionOrchestrator:
 class ItemDataExtractor:
     """Extrator especializado em dados de itens"""
     
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, numero_evento: str = None):
         self.page = page
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
+        self.numero_evento = numero_evento or "sem_numero"
+        self.anexos_dir = Path("anexos") / str(self.numero_evento)
+        self.anexos_dir.mkdir(parents=True, exist_ok=True)
     
     def extract_all_items(self) -> List[ExtractedItemData]:
         """Extrai dados de todos os itens da página"""
@@ -535,24 +539,51 @@ class ItemDataExtractor:
         return text
     
     def _extract_attachments(self, form) -> str:
-        """Extrai arquivos anexados"""
+        """Extrai e baixa arquivos anexados, salvando na pasta da cotação"""
         try:
             attachment_links = form.locator("a[href*='attachment'], a[href*='download']").all()
             attachments = []
-            
             for link in attachment_links:
                 try:
                     text = link.text_content().strip()
                     href = link.get_attribute("href")
-                    attachments.append(text or href)
-                except Exception:
+                    if not href:
+                        continue
+                    # Tenta obter o nome do arquivo do texto ou do href
+                    filename = text or Path(href).name
+                    # Se o href for relativo, torna absoluto
+                    if href.startswith('/'):
+                        base_url = self.page.url.split('/quote_supplier_land')[0]
+                        full_url = base_url + href
+                    else:
+                        full_url = href
+                    # Baixa o arquivo
+                    local_path = self._download_file(full_url, filename)
+                    if local_path:
+                        attachments.append(local_path.name)
+                except Exception as e:
+                    self.logger.warning(f"Erro ao baixar anexo: {str(e)}")
                     continue
-            
             return ", ".join(attachments)
-            
         except Exception as e:
             self.logger.warning(f"Erro ao extrair anexos: {str(e)}")
             return ""
+    def _download_file(self, url: str, filename: str) -> Path:
+        """Baixa o arquivo do anexo e salva na pasta da cotação"""
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            safe_filename = self._sanitize_filename(filename)
+            file_path = self.anexos_dir / safe_filename
+            with open(file_path, 'wb') as f:
+                f.write(response.content)
+            return file_path
+        except Exception as e:
+            self.logger.warning(f"Erro ao baixar arquivo {url}: {str(e)}")
+            return None
+    def _sanitize_filename(self, filename: str) -> str:
+        """Remove caracteres inválidos do nome do arquivo"""
+        return re.sub(r'[<>:"/\\|?*]', '_', filename)
     
     def _is_valid_item(self, item: ExtractedItemData) -> bool:
         """Verifica se o item tem dados válidos"""
@@ -1104,7 +1135,8 @@ class QuoteCrawler:
             self._update_status(f"🔍 Extraindo itens da cotação {quote_data['evento']}...")
             
             # Extrai itens da cotação
-            extractor = ItemDataExtractor(page)
+            # Passa o numero_evento para o extrator
+            extractor = ItemDataExtractor(page, quote_data.get('numero_evento', None))
             items = extractor.extract_all_items()
             
             if items:
