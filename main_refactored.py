@@ -29,6 +29,63 @@ from pathlib import Path
 import requests
 
 # ==========================================
+# FUNÇÕES UTILITÁRIAS GLOBAIS
+# ==========================================
+
+def convert_to_number(value: str) -> str:
+    """Converte string para formato número, removendo caracteres não numéricos"""
+    if not value:
+        return ""
+    try:
+        # Remove caracteres não numéricos exceto ponto e vírgula
+        numero_limpo = re.sub(r'[^\d,\.]', '', value.strip())
+        # Converte vírgula para ponto se necessário
+        numero_limpo = numero_limpo.replace(',', '.')
+        # Verifica se é um número válido
+        float(numero_limpo)
+        return numero_limpo
+    except (ValueError, AttributeError):
+        # Se não conseguiu converter, retorna o valor original limpo com vírgula convertida
+        numero_limpo = re.sub(r'[^\d,\.]', '', value.strip())
+        return numero_limpo.replace(',', '.')
+
+def convert_to_date_format(date_str: str) -> str:
+    """Converte string de data para formato padrão DD/MM/YYYY"""
+    if not date_str:
+        return ""
+    try:
+        # Remove espaços extras
+        date_str = date_str.strip()
+        
+        # Padrões comuns de data
+        patterns = [
+            (r'^(\d{1,2})/(\d{1,2})/(\d{2,4})$', 'DMY'),  # DD/MM/YY ou DD/MM/YYYY
+            (r'^(\d{1,2})-(\d{1,2})-(\d{2,4})$', 'DMY'),  # DD-MM-YY ou DD-MM-YYYY
+            (r'^(\d{4})-(\d{1,2})-(\d{1,2})$', 'YMD'),    # YYYY-MM-DD
+        ]
+        
+        for pattern, fmt in patterns:
+            match = re.match(pattern, date_str)
+            if match:
+                groups = match.groups()
+                if fmt == 'DMY':
+                    day = groups[0].zfill(2)
+                    month = groups[1].zfill(2)
+                    year = groups[2]
+                elif fmt == 'YMD':
+                    year = groups[0]
+                    month = groups[1].zfill(2)
+                    day = groups[2].zfill(2)
+                # Corrige ano com 2 dígitos
+                if len(year) == 2:
+                    year = f"20{year}" if int(year) < 50 else f"19{year}"
+                return f"{day}/{month}/{year}"
+        
+        return date_str
+    except Exception:
+        return date_str
+
+# ==========================================
 # CONFIGURAÇÕES E TIPOS
 # ==========================================
 
@@ -93,6 +150,9 @@ class ExtractedItemData(TypedDict):
     data_necessaria: str
     detalhes: str
     arquivos_anexados: str
+    ncm: str  # Novo campo NCM
+    numero_planta: str  # Novo campo número da planta
+    estado_planta: str  # Novo campo estado da planta
 
 class QuoteData(TypedDict):
     """Estrutura dos dados de uma cotação"""
@@ -476,18 +536,46 @@ class ItemDataExtractor:
     def _extract_single_item(self, index: int, total: int) -> ExtractedItemData:
         """Extrai dados de um item específico"""
         try:
+            # Obtém o formulário específico do item usando índice
             form = self.page.locator("form.s-itemsAndServicesFieldGrid").nth(index)
+            
+            # Extrai descrição completa (incluindo inglês e espanhol)
             raw_desc = self._extract_field("div.s-description p.s-textField", index)
             codigo_item, descricao_sem_codigo = self._split_codigo_descricao(raw_desc)
+            
+            # Extrai descrição estendida completa (sem filtrar apenas português)
+            descricao_estendida_completa = self._extract_complete_extended_description(index)
+            
+            # Extrai quantidade e converte para número
+            quantidade_raw = self._extract_field("div.s-quantity span.s-value", index)
+            quantidade = convert_to_number(quantidade_raw)
+            
+            # Extrai data e converte para formato data
+            data_necessaria_raw = self._extract_field("div.s-need_by_date p.s-textField", index)
+            data_necessaria = convert_to_date_format(data_necessaria_raw)
+            
+            # Extrai detalhes e processa número da planta e estado
+            detalhes_raw = self._extract_field("div.s-details li span", index)
+            numero_planta, estado_planta = self._extract_planta_info(detalhes_raw)
+            
+            # Extrai NCM
+            ncm = self._extract_ncm(index)
+            
+            # Extrai anexos de forma mais específica
+            arquivos_anexados = self._extract_attachments_specific(form, index)
+            
             return ExtractedItemData(
                 numero_item=f"{index + 1}/{total}",
-                codigo_item=codigo_item,
+                codigo_item=convert_to_number(codigo_item),
                 descricao=descricao_sem_codigo,
-                descricao_estendida=self._extract_extended_description(index),
-                quantidade=self._extract_field("div.s-quantity span.s-value", index),
-                data_necessaria=self._extract_field("div.s-need_by_date p.s-textField", index),
-                detalhes=self._extract_field("div.s-details li span", index),
-                arquivos_anexados=self._extract_attachments(form)
+                descricao_estendida=descricao_estendida_completa,
+                quantidade=quantidade,
+                data_necessaria=data_necessaria,
+                detalhes=detalhes_raw,
+                arquivos_anexados=arquivos_anexados,
+                ncm=ncm,
+                numero_planta=numero_planta,
+                estado_planta=estado_planta
             )
         except Exception as e:
             self.logger.warning(f"Erro ao extrair item {index + 1}: {str(e)}")
@@ -498,13 +586,31 @@ class ItemDataExtractor:
         try:
             elements = self.page.locator(selector)
             if elements.count() > index:
-                return elements.nth(index).text_content().strip()
+                raw_text = elements.nth(index).text_content().strip()
+                # Remove quebras de linha e normaliza espaços
+                clean_text = re.sub(r'\s+', ' ', raw_text)
+                return clean_text
         except Exception as e:
             self.logger.warning(f"Erro ao extrair campo '{selector}': {str(e)}")
         return ""
     
+    def _extract_complete_extended_description(self, index: int) -> str:
+        """Extrai descrição estendida completa (incluindo inglês e espanhol) sem quebras de linha"""
+        try:
+            selector = "div.s-extended_description p.s-textField"
+            raw_text = self._extract_field(selector, index)
+            if not raw_text:
+                return ""
+            
+            # Remove quebras de linha e normaliza espaços
+            text_limpo = re.sub(r'\s+', ' ', raw_text.strip())
+            return text_limpo
+        except Exception as e:
+            self.logger.warning(f"Erro ao extrair descrição estendida completa: {str(e)}")
+            return ""
+    
     def _extract_extended_description(self, index: int) -> str:
-        """Extrai e processa descrição estendida"""
+        """Extrai e processa descrição estendida (método legado para compatibilidade)"""
         try:
             selector = "div.s-extended_description p.s-textField"
             raw_text = self._extract_field(selector, index)
@@ -538,36 +644,90 @@ class ItemDataExtractor:
         
         return text
     
-    def _extract_attachments(self, form) -> str:
-        """Extrai e baixa arquivos anexados, salvando na pasta da cotação"""
+    def _extract_attachments_specific(self, form, index: int) -> str:
+        """Extrai anexos de forma robusta, garantindo que pertencem ao item correto e cobrindo mais casos de links"""
         try:
-            attachment_links = form.locator("a[href*='attachment'], a[href*='download']").all()
-            attachments = []
-            for link in attachment_links:
+            attachments = set()
+            
+            # Primeiro, busca anexos na estrutura específica do Vale Coupa
+            attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
+            for attachment_list in attachment_lists:
                 try:
-                    text = link.text_content().strip()
-                    href = link.get_attribute("href")
-                    if not href:
-                        continue
-                    # Tenta obter o nome do arquivo do texto ou do href
-                    filename = text or Path(href).name
-                    # Se o href for relativo, torna absoluto
-                    if href.startswith('/'):
-                        base_url = self.page.url.split('/quote_supplier_land')[0]
-                        full_url = base_url + href
-                    else:
-                        full_url = href
-                    # Baixa o arquivo
-                    local_path = self._download_file(full_url, filename)
-                    if local_path:
-                        attachments.append(local_path.name)
+                    # Busca links dentro da lista de anexos
+                    file_links = attachment_list.locator("li.attachment.attachmentFile.s-attachmentFile a").all()
+                    for link in file_links:
+                        try:
+                            if not link.is_visible():
+                                continue
+                            href = link.get_attribute("href")
+                            if not href:
+                                continue
+                            text = (link.text_content() or "").strip()
+                            filename = text or Path(href).name
+                            filename = filename.strip()
+                            if not filename:
+                                continue
+                            # Normaliza nome
+                            filename = re.sub(r'\s+', ' ', filename)
+                            attachments.add(filename)
+                        except Exception as e:
+                            self.logger.warning(f"Erro ao processar anexo da lista: {str(e)}")
+                            continue
                 except Exception as e:
-                    self.logger.warning(f"Erro ao baixar anexo: {str(e)}")
+                    self.logger.warning(f"Erro ao processar lista de anexos: {str(e)}")
                     continue
-            return ", ".join(attachments)
+            
+            # Se não encontrou anexos na estrutura específica, busca com seletores genéricos
+            if not attachments:
+                attachment_selectors = [
+                    "a[href*='attachment']",
+                    "a[href*='download']",
+                    "a[href*='file']",
+                    "a[href*='document']",
+                    "a[href*='.pdf']",
+                    "a[href*='.doc']",
+                    "a[href*='.docx']",
+                    "a[href*='.xls']",
+                    "a[href*='.xlsx']",
+                    "a[href*='.zip']",
+                    "a[href*='.rar']",
+                    "a[download]",
+                    "a[target='_blank']"
+                ]
+                for selector in attachment_selectors:
+                    try:
+                        links = form.locator(selector).all()
+                        for link in links:
+                            try:
+                                if not link.is_visible():
+                                    continue
+                                href = link.get_attribute("href")
+                                if not href:
+                                    continue
+                                text = (link.text_content() or "").strip()
+                                filename = text or Path(href).name
+                                filename = filename.strip()
+                                if not filename:
+                                    continue
+                                # Ignora textos genéricos
+                                generic_texts = ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]
+                                if filename.lower() in generic_texts:
+                                    continue
+                                # Normaliza nome
+                                filename = re.sub(r'\s+', ' ', filename)
+                                attachments.add(filename)
+                            except Exception as e:
+                                self.logger.warning(f"Erro ao processar anexo individual: {str(e)}")
+                                continue
+                    except Exception as e:
+                        self.logger.warning(f"Erro ao buscar anexos com seletor {selector}: {str(e)}")
+                        continue
+            
+            return ", ".join(sorted(attachments)) if attachments else ""
         except Exception as e:
-            self.logger.warning(f"Erro ao extrair anexos: {str(e)}")
+            self.logger.warning(f"Erro ao extrair anexos específicos: {str(e)}")
             return ""
+    
     def _download_file(self, url: str, filename: str) -> Path:
         """Baixa o arquivo do anexo e salva na pasta da cotação"""
         try:
@@ -593,12 +753,60 @@ class ItemDataExtractor:
         """Separa o código do início da descrição (antes do primeiro '||')"""
         if not raw_desc:
             return "", ""
+        
+        # Remove quebras de linha e normaliza espaços
+        raw_desc = re.sub(r'\s+', ' ', raw_desc.strip())
+        
         partes = raw_desc.split('||', 1)
         if len(partes) == 2:
             codigo = partes[0].strip()
             descricao = partes[1].strip()
             return codigo, descricao
-        return "", raw_desc.strip()
+        return "", raw_desc
+    
+    def _extract_planta_info(self, detalhes: str) -> tuple[str, str]:
+        """Extrai número da planta e estado da planta dos detalhes"""
+        if not detalhes:
+            return "", ""
+        
+        try:
+            # Padrão para extrair número da planta após "Local de entrega:"
+            numero_match = re.search(r'Local de entrega:\s*(\d+)', detalhes)
+            numero_planta = numero_match.group(1) if numero_match else ""
+            
+            # Padrão para extrair estado (2 letras antes de "- BR")
+            estado_match = re.search(r'-\s*([A-Z]{2})\s*-\s*BR', detalhes)
+            estado_planta = estado_match.group(1) if estado_match else ""
+            
+            return numero_planta, estado_planta
+        except Exception:
+            return "", ""
+    
+    def _extract_ncm(self, index: int) -> str:
+        """Extrai código NCM do campo próprio do item"""
+        try:
+            # Seletor específico baseado no HTML fornecido
+            ncm_selectors = [
+                "div.s-classification_of_goods p.s-textField",  # Seletor específico do NCM
+                "div.s-showField.s-classification_of_goods p.s-textField",  # Seletor mais específico
+                "div[class*=classification_of_goods] p.s-textField",  # Seletor alternativo
+                "div.s-ncm span.s-value",  # Fallback para outros possíveis seletores
+                "div.s-ncm p.s-textField",
+                "div[data-field='ncm'] span",
+                "div[data-field='ncm'] p",
+                "td[data-field='ncm']",
+                "span[data-field='ncm]"
+            ]
+            
+            for selector in ncm_selectors:
+                ncm = self._extract_field(selector, index)
+                if ncm and ncm.strip():
+                    return ncm.strip()
+            
+            return ""
+        except Exception as e:
+            self.logger.warning(f"Erro ao extrair NCM: {str(e)}")
+            return ""
     
     def _create_empty_item(self, index: int, total: int) -> ExtractedItemData:
         """Cria item vazio em caso de erro"""
@@ -610,8 +818,44 @@ class ItemDataExtractor:
             quantidade="",
             data_necessaria="",
             detalhes="",
-            arquivos_anexados=""
+            arquivos_anexados="",
+            ncm="",
+            numero_planta="",
+            estado_planta=""
         )
+
+    def _is_attachment_belongs_to_item(self, link, form) -> bool:
+        """Verifica se o anexo realmente pertence ao item específico"""
+        try:
+            # Verifica se o link está visível
+            if not link.is_visible():
+                return False
+            
+            # Verifica se o link tem um href válido
+            href = link.get_attribute("href")
+            if not href:
+                return False
+            
+            # Verifica se o link está dentro do formulário do item
+            # Como já estamos buscando dentro do form.locator(), isso deve ser suficiente
+            # Apenas verifica se o link está realmente dentro do contexto do formulário
+            try:
+                # Verifica se conseguimos encontrar o link dentro do formulário
+                # Se conseguirmos, significa que pertence ao item
+                form.locator(f"a[href={href}]").count() > 0
+                return True
+            except:
+                # Se não conseguir encontrar, pode ser que o href tenha parâmetros
+                # Nesse caso, verifica apenas se está visível e tem href
+                return True
+                
+        except Exception:
+            return False
+
+    def _extract_attachments(self, form) -> str:
+        """Extrai e baixa arquivos anexados, salvando na pasta da cotação (método legado)"""
+        # Chama o método específico sem índice para compatibilidade
+        return self._extract_attachments_specific(form, -1)
 
 # ==========================================
 # PROCESSADOR DE DUPLICATAS
@@ -708,23 +952,65 @@ class DataExporter:
         self.duplicate_processor = DuplicateProcessor()
 
     def export_to_excel(self, data: List[Dict[str, str]], filename: str) -> bool:
-        """Exporta dados para Excel (.xlsx) usando openpyxl puro (sem remover duplicatas)"""
+        """Exporta dados para Excel (.xlsx) usando openpyxl puro com formatação adequada"""
         if not data:
             return False
         try:
             from openpyxl import Workbook
+            from openpyxl.styles import NamedStyle, Font, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+            
             # NÃO remove duplicatas!
             filtered_data = data
             # Cria workbook
             wb = Workbook()
             ws = wb.active
             ws.title = "Cotações"
+            
             # Cabeçalho
             headers = list(filtered_data[0].keys())
             ws.append(headers)
-            # Dados
-            for row in filtered_data:
-                ws.append([row.get(h, "") for h in headers])
+            
+            # Estilo para cabeçalho
+            header_style = NamedStyle(name="header_style")
+            header_style.font = Font(bold=True, color="FFFFFF")
+            header_style.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            header_style.border = Border(
+                left=Side(style='thin'),
+                right=Side(style='thin'),
+                top=Side(style='thin'),
+                bottom=Side(style='thin')
+            )
+            
+            # Aplica estilo ao cabeçalho
+            for cell in ws[1]:
+                cell.style = header_style
+            
+            # Dados com formatação
+            for row_idx, row_data in enumerate(filtered_data, start=2):
+                for col_idx, header in enumerate(headers, start=1):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    value = row_data.get(header, "")
+                    
+                    # Aplica formatação baseada no tipo de campo
+                    if self._is_numeric_field(header, value):
+                        cell.value = self._convert_to_excel_number(value)
+                        cell.number_format = '#,##0'  # Sem casas decimais
+                    elif self._is_date_field(header, value):
+                        cell.value = self._convert_to_excel_date(value)
+                        cell.number_format = 'dd/mm/yyyy'
+                    else:
+                        cell.value = value
+                        cell.number_format = '@'  # Formato texto
+                    
+                    # Aplica bordas
+                    cell.border = Border(
+                        left=Side(style='thin'),
+                        right=Side(style='thin'),
+                        top=Side(style='thin'),
+                        bottom=Side(style='thin')
+                    )
+            
             # Ajusta largura das colunas
             for col in ws.columns:
                 max_length = 0
@@ -736,6 +1022,7 @@ class DataExporter:
                     except:
                         pass
                 ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 80)
+            
             # Salva arquivo
             excel_filename = filename.replace('.csv', '.xlsx') if filename.endswith('.csv') else filename + '.xlsx'
             wb.save(excel_filename)
@@ -744,6 +1031,49 @@ class DataExporter:
         except Exception as e:
             self.logger.error(f"Erro ao exportar Excel: {str(e)}")
             return False
+    
+    def _is_numeric_field(self, header: str, value: str) -> bool:
+        """Verifica se o campo deve ser tratado como numérico"""
+        numeric_headers = [
+            'evento', 'numero_evento', 'codigo_item', 'quantidade',
+            'numero_planta', 'ncm'
+        ]
+        return header.lower() in numeric_headers and value.strip()
+    
+    def _is_date_field(self, header: str, value: str) -> bool:
+        """Verifica se o campo deve ser tratado como data"""
+        date_headers = [
+            'data_inicial', 'data_final', 'data_necessaria'
+        ]
+        return header.lower() in date_headers and value.strip()
+    
+    def _convert_to_excel_number(self, value: str):
+        """Converte string para número do Excel, incluindo NCM como inteiro"""
+        try:
+            # Se for NCM (formato 0000.00.00), remove pontos e converte para inteiro
+            if re.match(r'^\d{4}\.\d{2}\.\d{2}$', value.strip()):
+                return int(value.replace('.', ''))
+            # Para outros números, remove caracteres não numéricos exceto ponto
+            clean_value = re.sub(r'[^\d\.]', '', value.strip())
+            if clean_value:
+                return float(clean_value)
+            return None
+        except:
+            return None
+    
+    def _convert_to_excel_date(self, value: str):
+        """Converte string de data para data do Excel"""
+        try:
+            # Converte para formato DD/MM/YYYY se necessário
+            formatted_date = convert_to_date_format(value)
+            if formatted_date:
+                # Converte para objeto datetime
+                day, month, year = formatted_date.split('/')
+                from datetime import datetime
+                return datetime(int(year), int(month), int(day))
+            return None
+        except:
+            return None
     
     def get_export_summary(self, original_count: int, final_count: int, filename: str) -> str:
         """Gera resumo da exportação"""
@@ -1058,15 +1388,25 @@ class QuoteCrawler:
             cells = row.locator("td")
             if cells.count() < 7:
                 return None
+                
             evento_link = cells.nth(0).locator("a")
             if evento_link.count() == 0:
                 return None
+                
             evento = evento_link.text_content(timeout=3000).strip()
             raw_nome_evento = cells.nth(1).text_content(timeout=3000).strip()
             numero_evento, nome_evento_limpo = self._split_numero_nome_evento(raw_nome_evento)
             data_inicial = cells.nth(2).text_content(timeout=3000).strip()
             data_final = cells.nth(3).text_content(timeout=3000).strip()
             resposta = cells.nth(6).text_content(timeout=3000).strip()
+            
+            # Remove quebras de linha dos textos
+            evento = re.sub(r'\s+', ' ', evento)
+            nome_evento_limpo = re.sub(r'\s+', ' ', nome_evento_limpo)
+            data_inicial = re.sub(r'\s+', ' ', data_inicial)
+            data_final = re.sub(r'\s+', ' ', data_final)
+            resposta = re.sub(r'\s+', ' ', resposta)
+            
             return QuoteData(
                 evento=evento,
                 numero_evento=numero_evento,
@@ -1120,17 +1460,49 @@ class QuoteCrawler:
             # Atualiza status
             self._update_status(f"📄 Processando cotação {quote_data['evento']}...")
             
-            # Navega para a cotação
-            link = row.locator("td").nth(0).locator("a")
+            # Extrai o href do link da cotação
+            link_element = row.locator("td").nth(0).locator("a")
+            if link_element.count() == 0:
+                self.logger.error(f"Link da cotação {quote_data['evento']} não encontrado")
+                return False
             
-            link.click(timeout=5000)
-            time.sleep(3)  # Aguarda um pouco mais para garantir carregamento
+            # Extrai o href do link
+            href = link_element.get_attribute("href")
+            if not href:
+                self.logger.error(f"Href da cotação {quote_data['evento']} não encontrado")
+                return False
+            
+            self.logger.info(f"Link da cotação {quote_data['evento']}: {href}")
+            
+            # Se o href for relativo, torna absoluto
+            if href.startswith('/'):
+                full_url = f"{self.config.base_url}{href}"
+            else:
+                full_url = href
+            
+            # Navega diretamente para a URL da cotação
+            self.logger.info(f"Navegando para: {full_url}")
+            page.goto(full_url, timeout=10000)
+            time.sleep(3)  # Aguarda carregamento
             
             # Verifica se navegou corretamente
             current_url = page.url
-            if "quote_supplier_land" in current_url:
-                return False
+            self.logger.info(f"URL atual após navegação: {current_url}")
             
+            # Verifica se está na página correta (deve conter 'external_responses' ou 'quotes')
+            if "external_responses" not in current_url and "quotes" not in current_url:
+                self.logger.error(f"Falha na navegação para cotação {quote_data['evento']}. URL atual: {current_url}")
+                return False
+
+            # Verifica se é uma página de lista de respostas e navega para a primeira resposta
+            if self._is_quote_with_responses_page(page):
+                self.logger.info(f"Cotação {quote_data['evento']} é do tipo 'com respostas' - navegando para primeira resposta")
+                if not self._navigate_to_first_response(page):
+                    self.logger.error(f"Falha ao navegar para primeira resposta da cotação {quote_data['evento']}")
+                    return False
+                # Aguarda carregamento da página da resposta
+                time.sleep(3)
+
             # Atualiza status
             self._update_status(f"🔍 Extraindo itens da cotação {quote_data['evento']}...")
             
@@ -1160,13 +1532,66 @@ class QuoteCrawler:
         combined_data = []
         
         for item in items:
+            # Converte campos numéricos da cotação
+            quote_data_processed = {
+                "evento": convert_to_number(quote_data.get("evento", "")),
+                "numero_evento": convert_to_number(quote_data.get("numero_evento", "")),
+                "nome_evento": quote_data.get("nome_evento", ""),
+                "data_inicial": convert_to_date_format(quote_data.get("data_inicial", "")),
+                "data_final": convert_to_date_format(quote_data.get("data_final", "")),
+                "resposta": quote_data.get("resposta", "")
+            }
+            
             combined_item = {
-                **quote_data,  # Dados da cotação
-                **item         # Dados do item
+                **quote_data_processed,  # Dados da cotação processados
+                **item                   # Dados do item
             }
             combined_data.append(combined_item)
         
         return combined_data
+    
+    def _is_quote_with_responses_page(self, page: Page) -> bool:
+        """Detecta se a página é uma lista de respostas de cotação"""
+        try:
+            # Indicadores de página de respostas
+            indicators = [
+                "img.sprite-application_form",  # Ícone de exibir
+                "a[href*='response_id']",       # Links com response_id
+                "td:has-text('Exibir')",        # Coluna com ação Exibir
+            ]
+            for indicator in indicators:
+                if page.locator(indicator).count() > 0:
+                    self.logger.info(f"Página detectada como 'com respostas' - encontrado: {indicator}")
+                    return True
+            return False
+        except Exception as e:
+            self.logger.error(f"Erro ao detectar tipo de página: {str(e)}")
+            return False
+
+    def _navigate_to_first_response(self, page: Page) -> bool:
+        """Navega para a primeira resposta disponível na lista"""
+        try:
+            # Tenta clicar no ícone Exibir
+            view_buttons = page.locator("img.sprite-application_form")
+            if view_buttons.count() > 0:
+                self.logger.info("Clicando no primeiro botão 'Exibir'")
+                view_buttons.first.click()
+                time.sleep(3)
+                return True
+            # Ou tenta clicar no link com response_id
+            response_links = page.locator("a[href*='response_id']")
+            if response_links.count() > 0:
+                href = response_links.first.get_attribute("href")
+                if href:
+                    self.logger.info(f"Navegando para primeira resposta: {href}")
+                    page.goto(href, timeout=10000)
+                    time.sleep(3)
+                    return True
+            self.logger.error("Nenhum botão 'Exibir' ou link de resposta encontrado")
+            return False
+        except Exception as e:
+            self.logger.error(f"Erro ao navegar para primeira resposta: {str(e)}")
+            return False
     
     def _generate_filename(self) -> str:
         """Gera nome do arquivo com timestamp"""
