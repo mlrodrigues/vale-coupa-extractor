@@ -2,6 +2,14 @@
 Vale Coupa Web Crawler - Versão Refatorada
 Sistema para extração automatizada de cotações da plataforma Vale Coupa
 
+MUDANÇAS IMPLEMENTADAS:
+- Browser visível (headless=False) para acompanhar o processo
+- Ordenação automática da tabela pela coluna "Data inicial" em ordem decrescente
+- Verificação inteligente da ordenação usando múltiplos atributos (aria-sort e data-dir)
+- Tratamento robusto de inconsistências nos atributos de ordenação
+- Download automático de anexos com indicação clara na tabela
+- Extração robusta de anexos com múltiplas estratégias de detecção
+
 Arquitetura baseada em:
 - Strategy Pattern para diferentes estratégias de expansão
 - Factory Pattern para criação de extractors
@@ -564,6 +572,10 @@ class ItemDataExtractor:
             # Extrai anexos de forma mais específica
             arquivos_anexados = self._extract_attachments_specific(form, index)
             
+            # Se tem anexos, tenta fazer o download
+            if arquivos_anexados.strip():
+                self._download_attachments_for_item(form, index)
+            
             return ExtractedItemData(
                 numero_item=f"{index + 1}/{total}",
                 codigo_item=convert_to_number(codigo_item),
@@ -648,8 +660,138 @@ class ItemDataExtractor:
         """Extrai anexos de forma robusta, garantindo que pertencem ao item correto e cobrindo mais casos de links"""
         try:
             attachments = set()
+            self.logger.info(f"Tentando extrair anexos do item {index + 1}")
             
-            # Primeiro, busca anexos na estrutura específica do Vale Coupa
+            # Estratégia 1: Busca anexos na estrutura específica do Vale Coupa
+            attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
+            self.logger.info(f"Encontradas {len(attachment_lists)} listas de anexos específicas")
+            
+            for attachment_list in attachment_lists:
+                try:
+                    # Busca links dentro da lista de anexos
+                    file_links = attachment_list.locator("li.attachment.attachmentFile.s-attachmentFile a").all()
+                    self.logger.info(f"Encontrados {len(file_links)} links de anexos específicos")
+                    
+                    for link in file_links:
+                        try:
+                            if not link.is_visible():
+                                continue
+                            href = link.get_attribute("href")
+                            if not href:
+                                continue
+                            text = (link.text_content() or "").strip()
+                            filename = text or Path(href).name
+                            filename = filename.strip()
+                            if not filename:
+                                continue
+                            # Normaliza nome
+                            filename = re.sub(r'\s+', ' ', filename)
+                            attachments.add(filename)
+                            self.logger.info(f"Anexo específico encontrado: {filename}")
+                        except Exception as e:
+                            self.logger.warning(f"Erro ao processar anexo da lista: {str(e)}")
+                            continue
+                except Exception as e:
+                    self.logger.warning(f"Erro ao processar lista de anexos: {str(e)}")
+                    continue
+            
+            # Estratégia 2: Busca anexos com seletores genéricos se não encontrou específicos
+            if not attachments:
+                self.logger.info("Nenhum anexo encontrado na estrutura específica, tentando seletores genéricos")
+                attachment_selectors = [
+                    "a[href*='attachment']",
+                    "a[href*='download']",
+                    "a[href*='file']",
+                    "a[href*='document']",
+                    "a[href*='.pdf']",
+                    "a[href*='.doc']",
+                    "a[href*='.docx']",
+                    "a[href*='.xls']",
+                    "a[href*='.xlsx']",
+                    "a[href*='.zip']",
+                    "a[href*='.rar']",
+                    "a[download]",
+                    "a[target='_blank']"
+                ]
+                
+                for selector in attachment_selectors:
+                    try:
+                        links = form.locator(selector).all()
+                        if links:
+                            self.logger.info(f"Seletor '{selector}' encontrou {len(links)} links")
+                        
+                        for link in links:
+                            try:
+                                if not link.is_visible():
+                                    continue
+                                href = link.get_attribute("href")
+                                if not href:
+                                    continue
+                                text = (link.text_content() or "").strip()
+                                filename = text or Path(href).name
+                                filename = filename.strip()
+                                if not filename:
+                                    continue
+                                
+                                # Ignora textos genéricos
+                                generic_texts = ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]
+                                if filename.lower() in generic_texts:
+                                    continue
+                                
+                                # Normaliza nome
+                                filename = re.sub(r'\s+', ' ', filename)
+                                attachments.add(filename)
+                                self.logger.info(f"Anexo genérico encontrado: {filename}")
+                            except Exception as e:
+                                self.logger.warning(f"Erro ao processar anexo individual: {str(e)}")
+                                continue
+                    except Exception as e:
+                        self.logger.warning(f"Erro ao buscar anexos com seletor {selector}: {str(e)}")
+                        continue
+            
+            # Estratégia 3: Busca por qualquer link que pareça ser um anexo
+            if not attachments:
+                self.logger.info("Tentando busca por qualquer link que pareça anexo")
+                try:
+                    all_links = form.locator("a").all()
+                    self.logger.info(f"Total de links encontrados no formulário: {len(all_links)}")
+                    
+                    for link in all_links:
+                        try:
+                            if not link.is_visible():
+                                continue
+                            href = link.get_attribute("href")
+                            if not href:
+                                continue
+                            
+                            # Verifica se o href parece ser um arquivo
+                            if any(ext in href.lower() for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.txt']):
+                                text = (link.text_content() or "").strip()
+                                filename = text or Path(href).name
+                                filename = filename.strip()
+                                if filename and filename.lower() not in ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]:
+                                    filename = re.sub(r'\s+', ' ', filename)
+                                    attachments.add(filename)
+                                    self.logger.info(f"Anexo por extensão encontrado: {filename}")
+                        except Exception as e:
+                            continue
+                except Exception as e:
+                    self.logger.warning(f"Erro na busca por extensões: {str(e)}")
+            
+            result = ", ".join(sorted(attachments)) if attachments else ""
+            self.logger.info(f"Total de anexos extraídos para item {index + 1}: {len(attachments)} - Resultado: '{result}'")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao extrair anexos específicos do item {index + 1}: {str(e)}")
+            return ""
+    
+    def _download_attachments_for_item(self, form, index: int) -> None:
+        """Faz download dos anexos de um item específico"""
+        try:
+            self.logger.info(f"Tentando fazer download dos anexos do item {index + 1}")
+            
+            # Busca anexos na estrutura específica do Vale Coupa
             attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
             for attachment_list in attachment_lists:
                 try:
@@ -667,18 +809,25 @@ class ItemDataExtractor:
                             filename = filename.strip()
                             if not filename:
                                 continue
+                            
                             # Normaliza nome
                             filename = re.sub(r'\s+', ' ', filename)
-                            attachments.add(filename)
+                            
+                            # Faz o download
+                            if self._download_file(href, filename):
+                                self.logger.info(f"Anexo baixado com sucesso: {filename}")
+                            else:
+                                self.logger.warning(f"Falha ao baixar anexo: {filename}")
+                                
                         except Exception as e:
-                            self.logger.warning(f"Erro ao processar anexo da lista: {str(e)}")
+                            self.logger.warning(f"Erro ao processar anexo para download: {str(e)}")
                             continue
                 except Exception as e:
-                    self.logger.warning(f"Erro ao processar lista de anexos: {str(e)}")
+                    self.logger.warning(f"Erro ao processar lista de anexos para download: {str(e)}")
                     continue
             
             # Se não encontrou anexos na estrutura específica, busca com seletores genéricos
-            if not attachments:
+            if not attachment_lists:
                 attachment_selectors = [
                     "a[href*='attachment']",
                     "a[href*='download']",
@@ -709,35 +858,54 @@ class ItemDataExtractor:
                                 filename = filename.strip()
                                 if not filename:
                                     continue
+                                
                                 # Ignora textos genéricos
                                 generic_texts = ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]
                                 if filename.lower() in generic_texts:
                                     continue
+                                
                                 # Normaliza nome
                                 filename = re.sub(r'\s+', ' ', filename)
-                                attachments.add(filename)
+                                
+                                # Faz o download
+                                if self._download_file(href, filename):
+                                    self.logger.info(f"Anexo baixado com sucesso: {filename}")
+                                else:
+                                    self.logger.warning(f"Falha ao baixar anexo: {filename}")
+                                    
                             except Exception as e:
-                                self.logger.warning(f"Erro ao processar anexo individual: {str(e)}")
+                                self.logger.warning(f"Erro ao processar anexo individual para download: {str(e)}")
                                 continue
                     except Exception as e:
-                        self.logger.warning(f"Erro ao buscar anexos com seletor {selector}: {str(e)}")
+                        self.logger.warning(f"Erro ao buscar anexos com seletor {selector} para download: {str(e)}")
                         continue
-            
-            return ", ".join(sorted(attachments)) if attachments else ""
+                        
         except Exception as e:
-            self.logger.warning(f"Erro ao extrair anexos específicos: {str(e)}")
-            return ""
+            self.logger.error(f"Erro ao fazer download dos anexos do item {index + 1}: {str(e)}")
     
     def _download_file(self, url: str, filename: str) -> Path:
         """Baixa o arquivo do anexo e salva na pasta da cotação"""
         try:
+            # Se a URL for relativa, torna absoluta
+            if url.startswith('/'):
+                url = f"https://vale.coupahost.com{url}"
+            
+            self.logger.info(f"Fazendo download de: {url}")
             response = requests.get(url, timeout=30)
             response.raise_for_status()
+            
             safe_filename = self._sanitize_filename(filename)
             file_path = self.anexos_dir / safe_filename
+            
+            # Cria diretório se não existir
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
             with open(file_path, 'wb') as f:
                 f.write(response.content)
+            
+            self.logger.info(f"Arquivo salvo em: {file_path}")
             return file_path
+            
         except Exception as e:
             self.logger.warning(f"Erro ao baixar arquivo {url}: {str(e)}")
             return None
@@ -1285,8 +1453,83 @@ class QuoteCrawler:
             if page.locator(items_selector).count() > 0:
                 page.locator(items_selector).click()
                 time.sleep(1)
+            
+            # Verifica e ordena a tabela pela coluna "Data inicial" em ordem decrescente
+            self._ensure_table_sorted_by_start_time(page)
+            
         except Exception as e:
             self.logger.warning(f"Não foi possível configurar visualização: {str(e)}")
+    
+    def _ensure_table_sorted_by_start_time(self, page: Page) -> None:
+        """Verifica se a tabela está ordenada pela coluna 'Data inicial' em ordem decrescente"""
+        try:
+            # Aguarda a tabela carregar
+            page.wait_for_selector("table", timeout=10000)
+            
+            # Procura pelo cabeçalho da coluna "Data inicial"
+            start_time_header = page.locator("#th_start_time")
+            if start_time_header.count() == 0:
+                self.logger.warning("Cabeçalho 'Data inicial' não encontrado")
+                return
+            
+            # Verifica ambos os atributos para determinar o estado real da ordenação
+            aria_sort = start_time_header.get_attribute("aria-sort")
+            data_dir = start_time_header.get_attribute("data-dir")
+            
+            self.logger.info(f"Estado da ordenação - aria-sort: '{aria_sort}', data-dir: '{data_dir}'")
+            
+            # Determina se está em ordem decrescente
+            is_descending = self._is_descending_order(aria_sort, data_dir)
+            
+            if not is_descending:
+                self.logger.info("Ordenando tabela por 'Data inicial' em ordem decrescente...")
+                
+                # Clica no cabeçalho para ordenar
+                start_time_header.click()
+                time.sleep(2)
+                
+                # Aguarda um pouco mais para a ordenação ser aplicada
+                time.sleep(1)
+                
+                # Verifica se a ordenação foi aplicada
+                new_aria_sort = start_time_header.get_attribute("aria-sort")
+                new_data_dir = start_time_header.get_attribute("data-dir")
+                
+                self.logger.info(f"Após ordenação - aria-sort: '{new_aria_sort}', data-dir: '{new_data_dir}'")
+                
+                if self._is_descending_order(new_aria_sort, new_data_dir):
+                    self.logger.info("Tabela ordenada com sucesso em ordem decrescente")
+                else:
+                    self.logger.warning("Não foi possível confirmar se a ordenação foi aplicada corretamente")
+                    # Tenta clicar novamente se necessário
+                    if not self._is_descending_order(new_aria_sort, new_data_dir):
+                        self.logger.info("Tentando clicar novamente para garantir ordenação decrescente...")
+                        start_time_header.click()
+                        time.sleep(2)
+            else:
+                self.logger.info("Tabela já está ordenada por 'Data inicial' em ordem decrescente")
+                
+        except Exception as e:
+            self.logger.warning(f"Erro ao verificar/ordenar tabela: {str(e)}")
+    
+    def _is_descending_order(self, aria_sort: str, data_dir: str) -> bool:
+        """Determina se a tabela está em ordem decrescente baseado nos atributos"""
+        # Verifica aria-sort primeiro
+        if aria_sort:
+            if aria_sort.lower() == "decrescente":
+                return True
+            elif aria_sort.lower() == "crescente":
+                return False
+        
+        # Verifica data-dir como fallback
+        if data_dir:
+            if data_dir.upper() == "DESC":
+                return True
+            elif data_dir.upper() == "ASC":
+                return False
+        
+        # Se não conseguir determinar, assume que não está em ordem decrescente
+        return False
     
     def _process_quote_rows(self, page: Page, target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
         """Processa as linhas de cotações na tabela, aplicando filtro de resposta"""
