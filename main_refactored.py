@@ -35,6 +35,7 @@ from playwright.sync_api import Page, sync_playwright, TimeoutError as Playwrigh
 import sys
 from pathlib import Path
 import requests
+import json
 
 # ==========================================
 # FUNÇÕES UTILITÁRIAS GLOBAIS
@@ -147,6 +148,9 @@ class CrawlerConfig:
     headless: bool = True
     items_per_page: int = 90
     max_retries: int = 3
+    retry_delay_base_ms: int = 2000  # Delay base para retry (2 segundos)
+    quote_navigation_timeout_ms: int = 20000  # Timeout específico para navegação de cotações
+    response_navigation_timeout_ms: int = 15000  # Timeout para navegação de respostas
     
 class ExtractedItemData(TypedDict):
     """Estrutura dos dados extraídos de um item"""
@@ -1339,8 +1343,48 @@ class QuoteCrawler:
         if self.status_callback:
             self.status_callback(message)
     
+    def _retry_with_backoff(self, operation, operation_name: str, max_retries: int = None, base_delay_ms: int = None):
+        """
+        Executa uma operação com retry e backoff exponencial
+        
+        Args:
+            operation: Função lambda ou callable para executar
+            operation_name: Nome da operação para logging
+            max_retries: Número máximo de tentativas (usa config se None)
+            base_delay_ms: Delay base em ms (usa config se None)
+        
+        Returns:
+            Resultado da operação se bem-sucedida, False se falhar após todas as tentativas
+        """
+        max_retries = max_retries or self.config.max_retries
+        base_delay_ms = base_delay_ms or self.config.retry_delay_base_ms
+        
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt == 0:
+                    self.logger.info(f"Executando {operation_name} (tentativa {attempt + 1}/{max_retries + 1})")
+                else:
+                    self.logger.info(f"Retentando {operation_name} (tentativa {attempt + 1}/{max_retries + 1})")
+                
+                result = operation()
+                if attempt > 0:
+                    self.logger.info(f"{operation_name} bem-sucedida na tentativa {attempt + 1}")
+                return result
+                
+            except Exception as e:
+                if attempt == max_retries:
+                    self.logger.error(f"{operation_name} falhou após {max_retries + 1} tentativas: {str(e)}")
+                    return False
+                
+                # Calcula delay com backoff exponencial
+                delay_ms = base_delay_ms * (2 ** attempt)
+                self.logger.warning(f"{operation_name} falhou na tentativa {attempt + 1}: {str(e)}. Aguardando {delay_ms}ms antes da próxima tentativa...")
+                time.sleep(delay_ms / 1000)
+        
+        return False
+    
     def crawl_quotes(self, username: str, password: str, target_date: str, resposta_filtro: str = "todas") -> bool:
-        """Executa o processo completo de crawling"""
+        """Executa o processo completo de crawling com retry de cotações com erro"""
         try:
             self._update_status("🌐 Iniciando browser...")
             with sync_playwright() as playwright:
@@ -1354,14 +1398,32 @@ class QuoteCrawler:
                 if not auth_result:
                     self._update_status("❌ Falha no login")
                     return False
+                
+                # PRIMEIRA FASE: Processa todas as cotações normais
                 self._update_status("📋 Buscando cotações...")
                 quotes_data = self._extract_quotes_for_date(page, target_date, resposta_filtro)
+                
+                # SEGUNDA FASE: Tenta processar cotações que deram erro
+                failed_quotes = self._load_failed_quotes()
+                if failed_quotes:
+                    self._update_status(f"🔄 Tentando processar {len(failed_quotes)} cotações com erro...")
+                    retry_quotes_data = self._retry_failed_quotes(page, failed_quotes)
+                    
+                    # Combina dados das cotações normais com as de retry
+                    if retry_quotes_data:
+                        quotes_data.extend(retry_quotes_data)
+                        self._update_status(f"✅ {len(retry_quotes_data)} cotações com erro processadas com sucesso no retry")
+                    
+                    # Remove arquivo de cotações com erro
+                    self._clear_failed_quotes_file()
+                
+                # TERCEIRA FASE: Salva dados no Excel
                 if quotes_data and len(quotes_data) > 0:
                     self._update_status("💾 Salvando dados...")
                     filename = self._generate_filename()
                     success = self.data_exporter.export_to_excel(quotes_data, filename)
                     if success:
-                        self._update_status(f"✅ Dados salvos em Excel!")
+                        self._update_status(f"✅ Dados salvos em Excel! Total: {len(quotes_data)} itens")
                         return True
                     else:
                         self._update_status("❌ Erro na exportação")
@@ -1442,8 +1504,232 @@ class QuoteCrawler:
         # Configura visualização
         self._configure_page_view(page)
         
-        # Extrai cotações
-        return self._process_quote_rows(page, target_date, resposta_filtro)
+        # Primeiro: lista TODAS as cotações para a data em todas as páginas
+        all_quotes_list = self._list_all_quotes_for_date(page, target_date, resposta_filtro)
+        
+        if not all_quotes_list:
+            self.logger.warning(f"Nenhuma cotação encontrada para a data {target_date}")
+            return []
+        
+        self.logger.info(f"Total de cotações encontradas para processamento: {len(all_quotes_list)}")
+        
+        # Segundo: processa cada cotação da lista
+        return self._process_quotes_from_list(page, all_quotes_list, target_date, resposta_filtro)
+    
+    def _list_all_quotes_for_date(self, page: Page, target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
+        """Lista cotações para a data especificada até encontrar data inferior (otimizado para tabela ordenada)"""
+        all_quotes = []
+        current_page = 1
+        total_pages_checked = 0
+        found_older_date = False
+        
+        self.logger.info("=== INICIANDO LISTAGEM OTIMIZADA DE COTAÇÕES ===")
+        self.logger.info(f"Procurando cotações para data: {target_date}")
+        self.logger.info("Parando quando encontrar data inferior (tabela ordenada decrescente)")
+        
+        while True and not found_older_date:
+            try:
+                self.logger.info(f"Verificando página {current_page}...")
+                
+                # Aguarda a tabela carregar
+                page.wait_for_selector("table tbody tr", timeout=30000)
+                rows = page.locator("table tbody tr").all()
+                
+                if not rows:
+                    self.logger.info(f"Página {current_page} não tem linhas, finalizando listagem")
+                    break
+                
+                self.logger.info(f"Página {current_page}: {len(rows)} linhas encontradas")
+                
+                # Processa todas as linhas da página atual
+                page_quotes = 0
+                for i, row in enumerate(rows):
+                    try:
+                        if not row.is_visible(timeout=5000):
+                            continue
+                        
+                        # Extrai dados básicos da cotação
+                        quote_data = self._extract_quote_info_safe(row)
+                        if not quote_data:
+                            continue
+                        
+                        # Verifica se a data é inferior à desejada (parada otimizada)
+                        if self._is_date_older_than_target(quote_data["data_inicial"], target_date):
+                            self.logger.info(f"Encontrada cotação com data {quote_data['data_inicial']} < {target_date}")
+                            self.logger.info("Parando busca - tabela ordenada decrescente")
+                            found_older_date = True
+                            break
+                        
+                        # Filtro de data (deve ser igual à desejada)
+                        if target_date not in quote_data["data_inicial"]:
+                            continue
+                        
+                        # Filtro de resposta
+                        resposta_valor = self._extract_resposta_coluna(row)
+                        quote_data["resposta"] = resposta_valor
+                        
+                        # Aplica filtro de resposta
+                        if resposta_filtro == "0" and resposta_valor != "0":
+                            continue
+                        if resposta_filtro == "1" and resposta_valor == "0":
+                            continue
+                        
+                        # Adiciona à lista se não estiver duplicada
+                        if not self._cotacao_ja_na_lista(quote_data['evento'], all_quotes):
+                            all_quotes.append(quote_data)
+                            page_quotes += 1
+                            self.logger.debug(f"Página {current_page}, Linha {i}: Cotação {quote_data['evento']} adicionada à lista")
+                    
+                    except Exception as e:
+                        self.logger.debug(f"Erro ao processar linha {i} da página {current_page}: {str(e)}")
+                        continue
+                
+                # Se encontrou data mais antiga, para de procurar
+                if found_older_date:
+                    self.logger.info(f"Parando busca na página {current_page} - data inferior encontrada")
+                    break
+                
+                self.logger.info(f"Página {current_page}: {page_quotes} cotações adicionadas")
+                total_pages_checked += 1
+                
+                # Verifica se há próxima página
+                if not self._go_to_next_page(page):
+                    self.logger.info("Não há próxima página, finalizando listagem")
+                    break
+                
+                current_page += 1
+                
+                # Aguarda carregamento da nova página
+                time.sleep(2)
+                
+            except Exception as e:
+                self.logger.error(f"Erro ao processar página {current_page}: {str(e)}")
+                break
+        
+        # Log final da listagem
+        self.logger.info("=== RESUMO DA LISTAGEM OTIMIZADA ===")
+        self.logger.info(f"Total de páginas verificadas: {total_pages_checked}")
+        self.logger.info(f"Total de cotações encontradas para a data {target_date}: {len(all_quotes)}")
+        
+        if found_older_date:
+            self.logger.info("✅ Busca otimizada: parou ao encontrar data inferior")
+        else:
+            self.logger.info("ℹ️ Busca completa: verificou todas as páginas disponíveis")
+        
+        # Agrupa cotações por tipo de resposta para análise
+        quotes_with_responses = [q for q in all_quotes if q.get('resposta', '0') != '0']
+        quotes_without_responses = [q for q in all_quotes if q.get('resposta', '0') == '0']
+        
+        self.logger.info(f"Cotações com respostas: {len(quotes_with_responses)}")
+        self.logger.info(f"Cotações sem respostas: {len(quotes_without_responses)}")
+        
+        return all_quotes
+    
+    def _go_to_next_page(self, page: Page) -> bool:
+        """Tenta ir para a próxima página, retorna True se conseguiu"""
+        try:
+            # Procura por diferentes tipos de controles de paginação
+            next_page_selectors = [
+                "text='Próxima'",
+                "text='Next'",
+                "text='>'",
+                "[class*='next']",
+                "[class*='pagination-next']",
+                "a[href*='page=']"
+            ]
+            
+            for selector in next_page_selectors:
+                next_button = page.locator(selector)
+                if next_button.count() > 0:
+                    # Verifica se o botão está habilitado
+                    if next_button.is_enabled() and next_button.is_visible():
+                        next_button.click()
+                        time.sleep(2)
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.debug(f"Erro ao tentar ir para próxima página: {str(e)}")
+            return False
+    
+    def _cotacao_ja_na_lista(self, evento: str, lista_quotes: List[Dict[str, str]]) -> bool:
+        """Verifica se uma cotação já está na lista de cotações encontradas"""
+        return any(q.get('evento') == evento for q in lista_quotes)
+    
+    def _process_quotes_from_list(self, page: Page, quotes_list: List[Dict[str, str]], target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
+        """Processa cada cotação da lista previamente criada"""
+        all_quotes_data = []
+        total_quotes = len(quotes_list)
+        
+        self.logger.info("=== INICIANDO PROCESSAMENTO DAS COTAÇÕES ===")
+        self.logger.info(f"Total de cotações para processar: {total_quotes}")
+        
+        for i, quote_data in enumerate(quotes_list, 1):
+            try:
+                self.logger.info(f"Processando cotação {i}/{total_quotes}: Evento {quote_data['evento']}")
+                
+                # Navega para a página principal das cotações
+                quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
+                page.goto(quotes_url)
+                time.sleep(2)
+                
+                # Aguarda a tabela carregar
+                page.wait_for_selector("table tbody tr", timeout=30000)
+                
+                # Processa a cotação diretamente (não precisa mais encontrar na tabela)
+                sucesso = self._processar_cotacao_individual(page, None, quote_data, all_quotes_data)
+                
+                if sucesso:
+                    self.logger.info(f"✅ Cotação {quote_data['evento']} processada com sucesso ({i}/{total_quotes})")
+                else:
+                    self.logger.warning(f"⚠️ Cotação {quote_data['evento']} processada com erros ({i}/{total_quotes})")
+                
+                # Log de progresso a cada 10 cotações
+                if i % 10 == 0:
+                    self.logger.info(f"Progresso: {i}/{total_quotes} cotações processadas")
+                
+            except Exception as e:
+                self.logger.error(f"Erro ao processar cotação {quote_data['evento']}: {str(e)}")
+                continue
+        
+        # Log final do processamento
+        self.logger.info("=== RESUMO FINAL DO PROCESSAMENTO ===")
+        self.logger.info(f"Total de cotações encontradas: {total_quotes}")
+        self.logger.info(f"Total de cotações processadas: {len(all_quotes_data)}")
+        self.logger.info(f"Total de itens extraídos: {len(all_quotes_data)}")
+        
+        return all_quotes_data
+    
+    def _find_quote_row_by_evento(self, page: Page, evento: str):
+        """Encontra a linha da tabela que contém a cotação com o evento especificado"""
+        try:
+            rows = page.locator("table tbody tr").all()
+            
+            for i, row in enumerate(rows):
+                try:
+                    if not row.is_visible(timeout=3000):
+                        continue
+                    
+                    # Extrai o evento da linha
+                    cells = row.locator("td")
+                    if cells.count() >= 1:
+                        evento_cell = cells.nth(0)
+                        if evento_cell.count() > 0:
+                            evento_text = evento_cell.text_content(timeout=3000)
+                            if evento_text and evento.strip() in evento_text.strip():
+                                self.logger.debug(f"Linha {i} encontrada para evento {evento}")
+                                return row
+                
+                except Exception as e:
+                    self.logger.debug(f"Erro ao verificar linha {i}: {str(e)}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao procurar linha da cotação {evento}: {str(e)}")
+            return None
     
     def _configure_page_view(self, page: Page) -> None:
         """Configura visualização da página (items per page, etc.)"""
@@ -1531,99 +1817,7 @@ class QuoteCrawler:
         # Se não conseguir determinar, assume que não está em ordem decrescente
         return False
     
-    def _process_quote_rows(self, page: Page, target_date: str, resposta_filtro: str) -> List[Dict[str, str]]:
-        """Processa as linhas de cotações na tabela, aplicando filtro de resposta"""
-        all_quotes_data = []
-        
-        quotes_processed = 0
-        quotes_found_for_date = 0
-        total_rows_checked = 0
-        
-        # Configura timeout menor para detectar problemas rapidamente
-        page.set_default_timeout(10000)  # 10 segundos em vez de 60
-        
-        # Loop principal - recarrega a página a cada iteração para garantir estado consistente
-        while True:  # Remove limitação - processa até não encontrar mais cotações
-            try:
-                # Recarrega a tabela para garantir estado fresco
-                if quotes_processed > 0:
-                    quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
-                    page.goto(quotes_url)
-                    time.sleep(2)
-                
-                # Aguarda a tabela carregar
-                page.wait_for_selector("table tbody tr", timeout=10000)
-                rows = page.locator("table tbody tr").all()
-                
-                if not rows:
-                    break
-                
-                # Procura uma cotação não processada ainda
-                cotacao_encontrada = False
-                
-                for i, row in enumerate(rows):
-                    total_rows_checked += 1
-                    
-                    try:
-                        # Verifica se a linha existe e está visível com timeout reduzido
-                        if not row.is_visible(timeout=2000):
-                            continue
-                        
-                        # Extrai dados da cotação com timeout reduzido
-                        quote_data = self._extract_quote_info_safe(row)
-                        if not quote_data:
-                            continue
-                        
-                        # Filtro de data
-                        if target_date not in quote_data["data_inicial"]:
-                            continue
-                        
-                        # Filtro de resposta (coluna 6)
-                        resposta_valor = self._extract_resposta_coluna(row)
-                        quote_data["resposta"] = resposta_valor
-                        if resposta_filtro == "0" and resposta_valor != "0":
-                            continue
-                        if resposta_filtro == "1" and resposta_valor == "0":
-                            continue
-                        
-                        # Verifica se já processamos esta cotação
-                        if self._cotacao_ja_processada(quote_data['evento'], all_quotes_data):
-                            continue
-                        
-                        quotes_found_for_date += 1
-                        cotacao_encontrada = True
-                        
-                        # Processa esta cotação
-                        sucesso = self._processar_cotacao_individual(page, row, quote_data, all_quotes_data)
-                        
-                        if sucesso:
-                            quotes_processed += 1
-                        else:
-                            # Marca como processada mesmo se houve erro, para evitar loop infinito
-                            quotes_processed += 1
-                        
-                        # Sai do loop for para recarregar a página
-                        break
-                        
-                    except Exception as row_error:
-                        continue
-                
-                # Se não encontrou nenhuma cotação nova, para o processamento
-                if not cotacao_encontrada:
-                    break
-                    
-            except Exception as page_error:
-                self.logger.error(f"Erro ao recarregar página: {str(page_error)}")
-                break
-        
-        # Restaura timeout original
-        page.set_default_timeout(self.config.timeout_ms)
-        
-        # Log final apenas se não encontrou cotações
-        if quotes_found_for_date == 0:
-            self.logger.warning(f"Nenhuma cotação encontrada para a data '{target_date}'")
-        
-        return all_quotes_data
+
     
     def _extract_quote_info_safe(self, row) -> Optional[QuoteData]:
         """Extrai informações da cotação com tratamento de erro robusto"""
@@ -1698,50 +1892,39 @@ class QuoteCrawler:
         return any(item.get("evento") == evento for item in dados_processados)
     
     def _processar_cotacao_individual(self, page: Page, row, quote_data: QuoteData, all_quotes_data: List[Dict[str, str]]) -> bool:
-        """Processa uma cotação individual"""
+        """Processa uma cotação individual usando navegação direta por URL"""
         try:
             # Atualiza status
             self._update_status(f"📄 Processando cotação {quote_data['evento']}...")
             
-            # Extrai o href do link da cotação
-            link_element = row.locator("td").nth(0).locator("a")
-            if link_element.count() == 0:
-                self.logger.error(f"Link da cotação {quote_data['evento']} não encontrado")
-                return False
+            # SOLUÇÃO 2: Navegação direta por URL
+            # Constrói a URL direta para a cotação
+            cotacao_url = f"{self.config.base_url}/quotes/external_responses/{quote_data['evento']}"
             
-            # Extrai o href do link
-            href = link_element.get_attribute("href")
-            if not href:
-                self.logger.error(f"Href da cotação {quote_data['evento']} não encontrado")
-                return False
-            
-            self.logger.info(f"Link da cotação {quote_data['evento']}: {href}")
-            
-            # Se o href for relativo, torna absoluto
-            if href.startswith('/'):
-                full_url = f"{self.config.base_url}{href}"
-            else:
-                full_url = href
+            self.logger.info(f"Navegando diretamente para cotação {quote_data['evento']}: {cotacao_url}")
             
             # Navega diretamente para a URL da cotação
-            self.logger.info(f"Navegando para: {full_url}")
-            page.goto(full_url, timeout=10000)
+            page.goto(cotacao_url, timeout=15000)
             time.sleep(3)  # Aguarda carregamento
             
             # Verifica se navegou corretamente
             current_url = page.url
             self.logger.info(f"URL atual após navegação: {current_url}")
             
-            # Verifica se está na página correta (deve conter 'external_responses' ou 'quotes')
+            # Verifica se está na página correta
             if "external_responses" not in current_url and "quotes" not in current_url:
-                self.logger.error(f"Falha na navegação para cotação {quote_data['evento']}. URL atual: {current_url}")
+                error_msg = f"Falha na navegação. URL atual: {current_url}"
+                self.logger.error(f"Falha na navegação para cotação {quote_data['evento']}. {error_msg}")
+                self._save_failed_quote(quote_data, error_msg)
                 return False
 
             # Verifica se é uma página de lista de respostas e navega para a primeira resposta
             if self._is_quote_with_responses_page(page):
                 self.logger.info(f"Cotação {quote_data['evento']} é do tipo 'com respostas' - navegando para primeira resposta")
                 if not self._navigate_to_first_response(page):
+                    error_msg = "Falha ao navegar para primeira resposta"
                     self.logger.error(f"Falha ao navegar para primeira resposta da cotação {quote_data['evento']}")
+                    self._save_failed_quote(quote_data, error_msg)
                     return False
                 # Aguarda carregamento da página da resposta
                 time.sleep(3)
@@ -1762,12 +1945,16 @@ class QuoteCrawler:
                 self._update_status(f"✅ {len(items)} itens extraídos da cotação {quote_data['evento']}")
                 return True
             else:
-                self._update_status(f"⚠️ Nenhum item encontrado na cotação {quote_data['evento']}")
+                error_msg = "Nenhum item encontrado na cotação"
+                self._update_status(f"⚠️ {error_msg} {quote_data['evento']}")
+                self._save_failed_quote(quote_data, error_msg)
                 return False
                 
         except Exception as e:
+            error_msg = f"Erro inesperado: {str(e)}"
             self.logger.error(f"Erro ao processar cotação {quote_data['evento']}: {str(e)}")
             self._update_status(f"❌ Erro na cotação {quote_data['evento']}")
+            self._save_failed_quote(quote_data, error_msg)
             return False
     
     def _combine_quote_and_items_data(self, quote_data: QuoteData, items: List[ExtractedItemData]) -> List[Dict[str, str]]:
@@ -1827,7 +2014,7 @@ class QuoteCrawler:
                 href = response_links.first.get_attribute("href")
                 if href:
                     self.logger.info(f"Navegando para primeira resposta: {href}")
-                    page.goto(href, timeout=10000)
+                    page.goto(href, timeout=self.config.response_navigation_timeout_ms)
                     time.sleep(3)
                     return True
             self.logger.error("Nenhum botão 'Exibir' ou link de resposta encontrado")
@@ -1840,6 +2027,157 @@ class QuoteCrawler:
         """Gera nome do arquivo com timestamp"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"dados_cotacoes_{timestamp}.csv"
+
+    def _is_date_older_than_target(self, date_to_check: str, target_date: str) -> bool:
+        """Verifica se uma data é inferior à data desejada (para otimizar busca em tabela ordenada)"""
+        try:
+            # Converte as datas para objetos datetime para comparação
+            from datetime import datetime
+            
+            # Padrões de data comuns
+            date_patterns = [
+                '%d/%m/%y',      # DD/MM/YY
+                '%d/%m/%Y',      # DD/MM/YYYY
+                '%d-%m-%y',      # DD-MM-YY
+                '%d-%m-%Y',      # DD-MM-YYYY
+                '%Y-%m-%d',      # YYYY-MM-DD
+            ]
+            
+            # Tenta converter a data a ser verificada
+            date_obj = None
+            for pattern in date_patterns:
+                try:
+                    date_obj = datetime.strptime(date_to_check.strip(), pattern)
+                    break
+                except ValueError:
+                    continue
+            
+            if not date_obj:
+                self.logger.warning(f"Não foi possível converter data: {date_to_check}")
+                return False
+            
+            # Tenta converter a data alvo
+            target_obj = None
+            for pattern in date_patterns:
+                try:
+                    target_obj = datetime.strptime(target_date.strip(), pattern)
+                    break
+                except ValueError:
+                    continue
+            
+            if not target_obj:
+                self.logger.warning(f"Não foi possível converter data alvo: {target_date}")
+                return False
+            
+            # Compara as datas
+            is_older = date_obj < target_obj
+            
+            if is_older:
+                self.logger.debug(f"Data {date_to_check} ({date_obj}) é anterior a {target_date} ({target_obj})")
+            else:
+                self.logger.debug(f"Data {date_to_check} ({date_obj}) é igual ou posterior a {target_date} ({target_obj})")
+            
+            return is_older
+            
+        except Exception as e:
+            self.logger.warning(f"Erro ao comparar datas '{date_to_check}' e '{target_date}': {str(e)}")
+            return False
+
+    def _save_failed_quote(self, quote_data: QuoteData, error_msg: str) -> None:
+        """Salva cotação com erro em arquivo temporário para retry posterior"""
+        try:
+            failed_quotes_file = "cotações_com_erro.json"
+            
+            # Carrega cotações com erro existentes
+            failed_quotes = []
+            if os.path.exists(failed_quotes_file):
+                try:
+                    with open(failed_quotes_file, 'r', encoding='utf-8') as f:
+                        failed_quotes = json.load(f)
+                except:
+                    failed_quotes = []
+            
+            # Adiciona nova cotação com erro
+            failed_quote_info = {
+                "evento": quote_data.get("evento", ""),
+                "numero_evento": quote_data.get("numero_evento", ""),
+                "nome_evento": quote_data.get("nome_evento", ""),
+                "data_inicial": quote_data.get("data_inicial", ""),
+                "data_final": quote_data.get("data_final", ""),
+                "resposta": quote_data.get("resposta", ""),
+                "error_message": error_msg,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Verifica se já existe para não duplicar
+            if not any(q["evento"] == failed_quote_info["evento"] for q in failed_quotes):
+                failed_quotes.append(failed_quote_info)
+                
+                # Salva arquivo atualizado
+                with open(failed_quotes_file, 'w', encoding='utf-8') as f:
+                    json.dump(failed_quotes, f, ensure_ascii=False, indent=2)
+                
+                self.logger.info(f"Cotação {quote_data['evento']} salva para retry posterior: {error_msg}")
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar cotação com erro: {str(e)}")
+    
+    def _load_failed_quotes(self) -> List[Dict]:
+        """Carrega cotações com erro do arquivo temporário"""
+        try:
+            failed_quotes_file = "cotações_com_erro.json"
+            
+            if not os.path.exists(failed_quotes_file):
+                return []
+            
+            with open(failed_quotes_file, 'r', encoding='utf-8') as f:
+                failed_quotes = json.load(f)
+            
+            self.logger.info(f"Carregadas {len(failed_quotes)} cotações com erro para retry")
+            return failed_quotes
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao carregar cotações com erro: {str(e)}")
+            return []
+    
+    def _clear_failed_quotes_file(self):
+        """Remove arquivo de cotações com erro após processamento bem-sucedido"""
+        try:
+            failed_quotes_file = "cotações_com_erro.json"
+            if os.path.exists(failed_quotes_file):
+                os.remove(failed_quotes_file)
+                self.logger.info("Arquivo de cotações com erro removido após processamento bem-sucedido")
+        except Exception as e:
+            self.logger.error(f"Erro ao remover arquivo de cotações com erro: {str(e)}")
+    
+    def _retry_failed_quotes(self, page: Page, failed_quotes: List[Dict]) -> List[Dict[str, str]]:
+        """Tenta processar novamente as cotações que deram erro"""
+        retry_quotes_data = []
+        
+        for i, failed_quote in enumerate(failed_quotes):
+            try:
+                self._update_status(f"🔄 Retry cotação {i+1}/{len(failed_quotes)}: Evento {failed_quote['evento']}")
+                
+                # Converte para QuoteData
+                quote_data = QuoteData(
+                    evento=failed_quote["evento"],
+                    numero_evento=failed_quote["numero_evento"],
+                    nome_evento=failed_quote["nome_evento"],
+                    data_inicial=failed_quote["data_inicial"],
+                    data_final=failed_quote["data_final"],
+                    resposta=failed_quote["resposta"]
+                )
+                
+                # Tenta processar novamente
+                if self._processar_cotacao_individual(page, None, quote_data, retry_quotes_data):
+                    self.logger.info(f"✅ Cotação {quote_data['evento']} processada com sucesso no retry")
+                else:
+                    self.logger.warning(f"⚠️ Cotação {quote_data['evento']} ainda falhou no retry")
+                    
+            except Exception as e:
+                self.logger.error(f"Erro ao tentar retry da cotação {failed_quote['evento']}: {str(e)}")
+        
+        return retry_quotes_data
 
 # ==========================================
 # INTERFACE GRÁFICA
