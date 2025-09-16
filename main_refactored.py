@@ -575,6 +575,7 @@ class ItemDataExtractor:
             
             # Extrai anexos de forma mais específica
             arquivos_anexados = self._extract_attachments_specific(form, index)
+            self.logger.info(f"Item {index + 1}: Anexos extraídos: '{arquivos_anexados}'")
             
             # Se tem anexos, tenta fazer o download
             if arquivos_anexados.strip():
@@ -784,6 +785,31 @@ class ItemDataExtractor:
             
             result = ", ".join(sorted(attachments)) if attachments else ""
             self.logger.info(f"Total de anexos extraídos para item {index + 1}: {len(attachments)} - Resultado: '{result}'")
+            
+            # Se não encontrou anexos, tenta uma busca mais ampla
+            if not result:
+                self.logger.info(f"Tentando busca mais ampla de anexos para item {index + 1}")
+                # Busca por qualquer link que possa ser um anexo
+                all_links = form.locator("a").all()
+                for link in all_links:
+                    try:
+                        if not link.is_visible():
+                            continue
+                        href = link.get_attribute("href")
+                        text = (link.text_content() or "").strip()
+                        
+                        # Verifica se parece ser um anexo
+                        if href and any(ext in href.lower() for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.jpg', '.png']):
+                            filename = text or Path(href).name
+                            if filename and filename not in ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]:
+                                attachments.add(filename)
+                                self.logger.info(f"Anexo encontrado na busca ampla: {filename}")
+                    except Exception as e:
+                        continue
+                
+                result = ", ".join(sorted(attachments)) if attachments else ""
+                self.logger.info(f"Resultado da busca ampla para item {index + 1}: '{result}'")
+            
             return result
             
         except Exception as e:
@@ -1166,8 +1192,13 @@ class DataExporter:
                     
                     # Aplica formatação baseada no tipo de campo
                     if self._is_numeric_field(header, value):
-                        cell.value = self._convert_to_excel_number(value)
-                        cell.number_format = '#,##0'  # Sem casas decimais
+                        converted_value = self._convert_to_excel_number(value)
+                        cell.value = converted_value
+                        # Se retornou string (para preservar formato de milhares), usa formato texto
+                        if isinstance(converted_value, str):
+                            cell.number_format = '@'  # Formato texto
+                        else:
+                            cell.number_format = '#,##0'  # Sem casas decimais
                     elif self._is_date_field(header, value):
                         cell.value = self._convert_to_excel_date(value)
                         cell.number_format = 'dd/mm/yyyy'
@@ -1228,6 +1259,11 @@ class DataExporter:
             # Para outros números, remove caracteres não numéricos exceto ponto
             clean_value = re.sub(r'[^\d\.]', '', value.strip())
             if clean_value:
+                # Para quantidade, preserva o formato original se tiver ponto como separador de milhares
+                if '.' in clean_value and len(clean_value.split('.')[-1]) <= 3:
+                    # Se tem ponto e a parte após o ponto tem 3 dígitos ou menos, 
+                    # provavelmente é separador de milhares, não decimal
+                    return clean_value  # Retorna como string para preservar formato
                 return float(clean_value)
             return None
         except:
@@ -1337,11 +1373,25 @@ class QuoteCrawler:
         self.auth_service = AuthenticationService(config)
         self.data_exporter = DataExporter()
         self.status_callback = None  # Callback para atualizar status na UI
+        self.progress_callback = None  # Callback para atualizar progresso na UI
+        self.stop_callback = None  # Callback para verificar se deve parar
+        self.data_callback = None  # Callback para armazenar dados extraídos
     
     def _update_status(self, message: str):
         """Atualiza status na interface se callback estiver definido"""
         if self.status_callback:
             self.status_callback(message)
+    
+    def _update_progress(self, current: int, total: int, current_quote: str = ""):
+        """Atualiza progresso na interface se callback estiver definido"""
+        if self.progress_callback:
+            self.progress_callback(current, total, current_quote)
+    
+    def _should_stop(self) -> bool:
+        """Verifica se deve parar a extração"""
+        if self.stop_callback:
+            return self.stop_callback()
+        return False
     
     def _retry_with_backoff(self, operation, operation_name: str, max_retries: int = None, base_delay_ms: int = None):
         """
@@ -1458,9 +1508,12 @@ class QuoteCrawler:
             # Tenta diferentes abordagens para encontrar o browser
             exe_dir = get_executable_dir()
             possible_browser_paths = [
-                exe_dir / "ms-playwright" / "chromium-1169" / "chrome-win" / "chrome.exe",
-                exe_dir / "_internal" / "ms-playwright" / "chromium-1169" / "chrome-win" / "chrome.exe",
-                exe_dir / "playwright" / "chromium-1169" / "chrome-win" / "chrome.exe"
+                exe_dir / "ms-playwright" / "chromium-1187" / "chrome-win" / "chrome.exe",
+                exe_dir / "_internal" / "ms-playwright" / "chromium-1187" / "chrome-win" / "chrome.exe",
+                exe_dir / "playwright" / "chromium-1187" / "chrome-win" / "chrome.exe",
+                exe_dir / "ms-playwright" / "chromium_headless_shell-1187" / "chrome-win" / "headless_shell.exe",
+                exe_dir / "_internal" / "ms-playwright" / "chromium_headless_shell-1187" / "chrome-win" / "headless_shell.exe",
+                exe_dir / "playwright" / "chromium_headless_shell-1187" / "chrome-win" / "headless_shell.exe"
             ]
             
             # Procura por um executável do Chrome válido
@@ -1667,7 +1720,15 @@ class QuoteCrawler:
         
         for i, quote_data in enumerate(quotes_list, 1):
             try:
+                # Verifica se deve parar
+                if self._should_stop():
+                    self.logger.info("Parada solicitada pelo usuário")
+                    break
+                
                 self.logger.info(f"Processando cotação {i}/{total_quotes}: Evento {quote_data['evento']}")
+                
+                # Atualiza progresso na interface
+                self._update_progress(i-1, total_quotes, quote_data['evento'])
                 
                 # Navega para a página principal das cotações
                 quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
@@ -1684,6 +1745,9 @@ class QuoteCrawler:
                     self.logger.info(f"✅ Cotação {quote_data['evento']} processada com sucesso ({i}/{total_quotes})")
                 else:
                     self.logger.warning(f"⚠️ Cotação {quote_data['evento']} processada com erros ({i}/{total_quotes})")
+                
+                # Atualiza progresso final
+                self._update_progress(i, total_quotes, quote_data['evento'])
                 
                 # Log de progresso a cada 10 cotações
                 if i % 10 == 0:
@@ -1942,6 +2006,10 @@ class QuoteCrawler:
                 quote_items = self._combine_quote_and_items_data(quote_data, items)
                 all_quotes_data.extend(quote_items)
                 
+                # Chama callback para armazenar dados se definido
+                if self.data_callback:
+                    self.data_callback(quote_items)
+                
                 self._update_status(f"✅ {len(items)} itens extraídos da cotação {quote_data['evento']}")
                 return True
             else:
@@ -1976,6 +2044,11 @@ class QuoteCrawler:
                 **quote_data_processed,  # Dados da cotação processados
                 **item                   # Dados do item
             }
+            
+            # Log para debug dos anexos
+            if 'arquivos_anexados' in combined_item and combined_item['arquivos_anexados']:
+                self.logger.info(f"Item combinado com anexos: {combined_item.get('arquivos_anexados', 'N/A')}")
+            
             combined_data.append(combined_item)
         
         return combined_data
@@ -2192,6 +2265,17 @@ class CrawlerGUI:
         self.crawler = QuoteCrawler(self.config)
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         
+        # Variáveis para controle de parada e progresso
+        self.extraction_thread = None
+        self.stop_extraction = False
+        self.current_quote = ""
+        self.total_quotes = 0
+        
+        # Variáveis para armazenar dados extraídos
+        self.extracted_data = []
+        self.data_exporter = DataExporter()
+        self.processed_quotes = 0
+        
         self._setup_ui()
     
     def _setup_ui(self) -> None:
@@ -2256,8 +2340,27 @@ class CrawlerGUI:
         action_card = ttk.Frame(self.root, style="Card.TFrame")
         action_card.pack(padx=20, pady=(10, 0), fill="x")
         ttk.Label(action_card, text="Iniciar Extração de Dados", style="Section.TLabel").pack(anchor="center", pady=(10, 5))
-        self.extract_button = ttk.Button(action_card, text="🚀 Extrair Cotações", style="Accent.TButton", command=self._start_extraction)
-        self.extract_button.pack(pady=(0, 10))
+        
+        # Frame para botões lado a lado
+        button_frame = ttk.Frame(action_card, style="Card.TFrame")
+        button_frame.pack(pady=(0, 10))
+        
+        self.extract_button = ttk.Button(button_frame, text="🚀 Extrair Cotações", style="Accent.TButton", command=self._start_extraction)
+        self.extract_button.pack(side="left", padx=(0, 10))
+        
+        self.stop_button = ttk.Button(button_frame, text="⏹️ Parar Extração", style="Accent.TButton", command=self._stop_extraction, state="disabled")
+        self.stop_button.pack(side="left")
+        
+        # Indicador de progresso
+        self.progress_frame = ttk.Frame(action_card, style="Card.TFrame")
+        self.progress_frame.pack(pady=(0, 10), fill="x")
+        
+        self.progress_label = ttk.Label(self.progress_frame, text="", font=("Segoe UI", 10), background="#fff")
+        self.progress_label.pack(anchor="w")
+        
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode='determinate')
+        self.progress_bar.pack(fill="x", pady=(5, 0))
+        
         ttk.Label(action_card, text="Clique no botão acima para iniciar a extração automática", font=("Segoe UI", 9), background="#fff").pack(anchor="center", pady=(0, 10))
 
         # Card de status/logs
@@ -2372,16 +2475,69 @@ class CrawlerGUI:
         resposta_filtro = self.resposta_map.get(resposta_legivel, "todas")
         if not self._validate_inputs(username, password, date):
             return
+        
+        # Reset das variáveis de controle
+        self.stop_extraction = False
+        self.current_quote = ""
+        self.total_quotes = 0
+        self.processed_quotes = 0
+        
+        # Limpa dados extraídos anteriores
+        self.extracted_data = []
+        
+        # Atualiza interface
         self.extract_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.progress_bar['value'] = 0
+        self.progress_label.config(text="")
         self.status_var.set("🔄 Processando...")
         self.root.update()
+        
         import threading
-        thread = threading.Thread(
+        self.extraction_thread = threading.Thread(
             target=self._execute_extraction,
             args=(username, password, date, resposta_filtro),
             daemon=True
         )
-        thread.start()
+        self.extraction_thread.start()
+    
+    def _stop_extraction(self) -> None:
+        """Para o processo de extração e gera Excel com dados já extraídos"""
+        self.stop_extraction = True
+        self.status_var.set("⏹️ Parando extração...")
+        self.stop_button.config(state="disabled")
+        self.root.update()
+        
+        # Gera Excel com dados já extraídos se houver
+        if self.extracted_data:
+            self.status_var.set("💾 Gerando Excel com dados extraídos...")
+            self.root.update()
+            
+            try:
+                filename = self._generate_filename()
+                success = self.data_exporter.export_to_excel(self.extracted_data, filename)
+                
+                if success:
+                    self.status_var.set(f"✅ Excel gerado com {len(self.extracted_data)} itens!")
+                    self.root.update()
+                    time.sleep(2)  # Aguarda 2 segundos para mostrar a mensagem
+                    self._show_success_and_close()
+                else:
+                    self.status_var.set("❌ Erro ao gerar Excel")
+                    self.root.update()
+                    time.sleep(2)
+                    self._show_error_and_close("Erro ao gerar arquivo Excel com os dados extraídos.")
+            except Exception as e:
+                self.logger.error(f"Erro ao gerar Excel: {str(e)}")
+                self.status_var.set("❌ Erro ao gerar Excel")
+                self.root.update()
+                time.sleep(2)
+                self._show_error_and_close(f"Erro ao gerar Excel: {str(e)}")
+        else:
+            self.status_var.set("⚠️ Nenhum dado extraído para salvar")
+            self.root.update()
+            time.sleep(2)
+            self._show_error_and_close("Nenhum dado foi extraído antes de parar a execução.")
     
     def _validate_inputs(self, username: str, password: str, date: str) -> bool:
         """Valida entradas do usuário"""
@@ -2400,14 +2556,33 @@ class CrawlerGUI:
         try:
             self.root.after(0, lambda: self.status_var.set("🔐 Conectando..."))
             crawler = QuoteCrawler(self.config)
+            
             def update_status(message):
                 self.root.after(0, lambda: self.status_var.set(message))
+            
+            def update_progress(current, total, current_quote=""):
+                self.root.after(0, lambda: self._update_progress_ui(current, total, current_quote))
+            
+            def store_extracted_data(data):
+                """Armazena dados extraídos para uso quando parar"""
+                self.extracted_data.extend(data)
+            
             crawler.status_callback = update_status
+            crawler.progress_callback = update_progress
+            crawler.stop_callback = lambda: self.stop_extraction
+            crawler.data_callback = store_extracted_data  # Novo callback para armazenar dados
+            
             result = crawler.crawl_quotes(username, password, date, resposta_filtro)
+            
+            if self.stop_extraction:
+                self.root.after(0, lambda: self.status_var.set("⏹️ Extração interrompida pelo usuário"))
+                self.root.after(0, lambda: self._reset_ui_after_extraction())
+                return
+            
             if result == "login_error":
                 self.root.after(0, lambda: self.status_var.set("❌ Usuário ou senha incorretos!"))
                 self.root.after(0, lambda: messagebox.showerror("Erro de Login", "Usuário ou senha incorretos! Por favor, tente novamente."))
-                self.root.after(0, lambda: self.extract_button.config(state="normal"))
+                self.root.after(0, lambda: self._reset_ui_after_extraction())
                 return
             if result:
                 self.root.after(0, lambda: self.status_var.set("✅ Extração concluída!"))
@@ -2415,19 +2590,51 @@ class CrawlerGUI:
             else:
                 self.root.after(0, lambda: self.status_var.set("❌ Falha na extração"))
                 self.root.after(0, lambda: messagebox.showerror("Erro", "Falha na extração. Verifique se há cotações para a data informada."))
+                self.root.after(0, lambda: self._reset_ui_after_extraction())
         except Exception as e:
             self.logger.error(f"Erro na thread de extração: {str(e)}")
             self.root.after(0, lambda: self.status_var.set("❌ Erro inesperado"))
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro inesperado: {str(e)}"))
-        finally:
-            self.root.after(0, lambda: self.extract_button.config(state="normal"))
+            self.root.after(0, lambda: self._reset_ui_after_extraction())
+    
+    def _update_progress_ui(self, current: int, total: int, current_quote: str = ""):
+        """Atualiza a interface de progresso"""
+        self.processed_quotes = current
+        self.total_quotes = total
+        self.current_quote = current_quote
+        
+        if total > 0:
+            progress_percent = (current / total) * 100
+            self.progress_bar['value'] = progress_percent
+            self.progress_label.config(text=f"Processando: {current_quote} ({current}/{total})")
+        else:
+            self.progress_label.config(text="Preparando extração...")
+    
+    def _reset_ui_after_extraction(self):
+        """Reseta a interface após a extração"""
+        self.extract_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self.progress_bar['value'] = 0
+        self.progress_label.config(text="")
     
     def _show_success_and_close(self) -> None:
         """Mostra mensagem de sucesso e fecha a aplicação"""
-        result = messagebox.showinfo("Sucesso", "Extração realizada com sucesso!\n\nO arquivo CSV foi gerado na pasta do programa.")
+        result = messagebox.showinfo("Sucesso", "Extração realizada com sucesso!\n\nO arquivo Excel foi gerado na pasta do programa.")
         # Fecha a aplicação após o usuário clicar OK
         self.root.quit()
         self.root.destroy()
+    
+    def _show_error_and_close(self, message: str) -> None:
+        """Mostra mensagem de erro e fecha a aplicação"""
+        messagebox.showerror("Erro", message)
+        # Fecha a aplicação após o usuário clicar OK
+        self.root.quit()
+        self.root.destroy()
+    
+    def _generate_filename(self) -> str:
+        """Gera nome do arquivo baseado na data atual"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"cotacoes_extraidas_{timestamp}.xlsx"
     
     def run(self) -> None:
         """Executa a aplicação"""
