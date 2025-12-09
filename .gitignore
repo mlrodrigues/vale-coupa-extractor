@@ -140,4 +140,12 @@ tmp/
 
 # Generated spec files with system-specific paths
 *_Headless.spec
-*_Portable.spec 
+*_Portable.spec
+
+# Credenciais armazenadas localmente (NUNCA commit)
+.credentials/
+*.key
+credentials.log
+
+# Arquivos de teste de credenciais
+.test_credentials/

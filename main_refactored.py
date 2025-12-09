@@ -94,6 +94,21 @@ def convert_to_date_format(date_str: str) -> str:
     except Exception:
         return date_str
 
+# Importa o gerenciador de credenciais
+try:
+    from credentials_manager import CredentialsManager
+    _CREDENTIALS_MANAGER_AVAILABLE = True
+    _CREDENTIALS_MANAGER_IMPORT_ERROR = None
+except ImportError as e:
+    CredentialsManager = None
+    _CREDENTIALS_MANAGER_AVAILABLE = False
+    _CREDENTIALS_MANAGER_IMPORT_ERROR = str(e)
+except Exception as e:
+    # Captura outros erros que podem ocorrer durante o import (ex: dependências faltando)
+    CredentialsManager = None
+    _CREDENTIALS_MANAGER_AVAILABLE = False
+    _CREDENTIALS_MANAGER_IMPORT_ERROR = str(e)
+
 # ==========================================
 # CONFIGURAÇÕES E TIPOS
 # ==========================================
@@ -138,6 +153,11 @@ class LogLevel(Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
 
+class CouperSource(Enum):
+    """Fontes de cotação disponíveis"""
+    FERROSOS = "ferrosos"
+    METALS = "metals"
+
 @dataclass
 class CrawlerConfig:
     """Configurações do crawler"""
@@ -148,6 +168,18 @@ class CrawlerConfig:
     headless: bool = True
     items_per_page: int = 90
     max_retries: int = 3
+    source: CouperSource = CouperSource.FERROSOS
+    
+    def __post_init__(self):
+        """Configura URLs baseado na fonte selecionada"""
+        if self.source == CouperSource.METALS:
+            self.base_url = "https://valebasemetals.coupahost.com"
+            self.login_path = "/sessions/supplier_login"  # Mesmo path
+            self.quotes_path = "/quote_supplier_land"      # Mesmo path
+        else:  # FERROSOS
+            self.base_url = "https://vale.coupahost.com"
+            self.login_path = "/sessions/supplier_login"
+            self.quotes_path = "/quote_supplier_land"
     retry_delay_base_ms: int = 2000  # Delay base para retry (2 segundos)
     quote_navigation_timeout_ms: int = 20000  # Timeout específico para navegação de cotações
     response_navigation_timeout_ms: int = 15000  # Timeout para navegação de respostas
@@ -159,6 +191,7 @@ class ExtractedItemData(TypedDict):
     descricao: str
     descricao_estendida: str
     quantidade: str
+    unidade: str  # Novo campo para unidade
     data_necessaria: str
     detalhes: str
     arquivos_anexados: str
@@ -558,9 +591,36 @@ class ItemDataExtractor:
             # Extrai descrição estendida completa (sem filtrar apenas português)
             descricao_estendida_completa = self._extract_complete_extended_description(index)
             
-            # Extrai quantidade e converte para número
+            # Extrai quantidade e unidade separadamente
             quantidade_raw = self._extract_field("div.s-quantity span.s-value", index)
             quantidade = convert_to_number(quantidade_raw)
+            
+            # Extrai unidade (pode estar em um span separado ou no mesmo elemento)
+            unidade = self._extract_field("div.s-quantity span.s-unit", index)
+            if not unidade:
+                # Tenta extrair de outros seletores possíveis
+                unidade = self._extract_field("div.s-quantity .s-unit", index)
+            if not unidade:
+                # Tenta extrair do texto completo da quantidade (ex: "10 UN")
+                if quantidade_raw:
+                    # Procura por padrões comuns de unidade no texto
+                    unidade_match = re.search(r'\b([A-Z]{1,4}|[a-z]{1,4}|UN|KG|M|M2|M3|PC|PÇ|LT|L|G|ML|CM|MM|PEÇAS|PECAS|PÇS)\b', quantidade_raw.upper())
+                    if unidade_match:
+                        unidade = unidade_match.group(1)
+            
+            # Normaliza unidade (remove espaços e converte para minúsculas, exceto siglas)
+            if unidade:
+                unidade = unidade.strip()
+                # Normaliza variações comuns
+                unidade_upper = unidade.upper()
+                if unidade_upper in ['PEÇAS', 'PECAS', 'PÇS']:
+                    unidade = 'peças'
+                elif unidade_upper in ['UN', 'UNID', 'UNIDADE', 'UNIDADES']:
+                    unidade = 'UN'
+                # Se for uma sigla conhecida, mantém maiúscula, senão converte para minúscula
+                siglas = ['UN', 'KG', 'M2', 'M3', 'LT', 'ML', 'CM', 'MM', 'PC', 'PÇ']
+                if unidade.upper() not in siglas and unidade != 'peças':
+                    unidade = unidade.lower()
             
             # Extrai data e converte para formato data
             data_necessaria_raw = self._extract_field("div.s-need_by_date p.s-textField", index)
@@ -587,6 +647,7 @@ class ItemDataExtractor:
                 descricao=descricao_sem_codigo,
                 descricao_estendida=descricao_estendida_completa,
                 quantidade=quantidade,
+                unidade=unidade or "",
                 data_necessaria=data_necessaria,
                 detalhes=detalhes_raw,
                 arquivos_anexados=arquivos_anexados,
@@ -624,7 +685,7 @@ class ItemDataExtractor:
             return text_limpo
         except Exception as e:
             self.logger.warning(f"Erro ao extrair descrição estendida completa: {str(e)}")
-            return ""
+        return ""
     
     def _extract_extended_description(self, index: int) -> str:
         """Extrai e processa descrição estendida (método legado para compatibilidade)"""
@@ -667,42 +728,170 @@ class ItemDataExtractor:
             attachments = set()
             self.logger.info(f"Tentando extrair anexos do item {index + 1}")
             
-            # Estratégia 1: Busca anexos na estrutura específica do Vale Coupa
-            attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
-            self.logger.info(f"Encontradas {len(attachment_lists)} listas de anexos específicas")
+            # DEBUG: Imprime HTML do item para diagnóstico
+            try:
+                html_snippet = form.evaluate("el => el.innerHTML")[:500]
+                self.logger.debug(f"HTML do item {index + 1}: {html_snippet}...")
+            except:
+                pass
+            
+            # Estratégia 0: Procura em TODO o documento por ul.attachments__list (não apenas no form)
+            # Isto cobre casos onde os anexos estão fora do form específico
+            attachment_lists = self.page.locator("ul.attachments__list.s-attachmentList").all()
+            self.logger.info(f"Estratégia 0 - Encontradas {len(attachment_lists)} listas em TODO doc (ul.attachments__list.s-attachmentList)")
+            
+            # Se não encontrou, tenta sem o segundo seletor em todo doc
+            if not attachment_lists:
+                attachment_lists = self.page.locator("ul.attachments__list").all()
+                self.logger.info(f"Estratégia 0b - Encontradas {len(attachment_lists)} listas em TODO doc (ul.attachments__list)")
+            
+            # Se ainda não encontrou, procura dentro do form
+            if not attachment_lists:
+                attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
+                self.logger.info(f"Estratégia 1a - Encontradas {len(attachment_lists)} listas no form (ul.attachments__list.s-attachmentList)")
+            
+            # Se não encontrou, tenta sem o segundo seletor no form
+            if not attachment_lists:
+                attachment_lists = form.locator("ul.attachments__list").all()
+                self.logger.info(f"Estratégia 1b - Encontradas {len(attachment_lists)} listas no form (ul.attachments__list)")
+            
+            # Se não encontrou, tenta por ul com li.attachment no form
+            if not attachment_lists:
+                attachment_lists = form.locator("ul").filter(has=self.page.locator("li.attachment.attachmentFile")).all()
+                self.logger.info(f"Estratégia 1c - Encontradas {len(attachment_lists)} listas no form (ul com li.attachment.attachmentFile)")
             
             for attachment_list in attachment_lists:
                 try:
-                    # Busca links dentro da lista de anexos
+                    # Estratégia 1 - Busca links dentro da lista de anexos (seletor completo)
                     file_links = attachment_list.locator("li.attachment.attachmentFile.s-attachmentFile a").all()
-                    self.logger.info(f"Encontrados {len(file_links)} links de anexos específicos")
+                    self.logger.info(f"  - Estratégia 1 Encontrados {len(file_links)} links (li.attachment.attachmentFile.s-attachmentFile a)")
+                    
+                    # Estratégia 2 - Se não encontrou, tenta sem classes extras
+                    if not file_links:
+                        file_links = attachment_list.locator("li.attachmentFile a").all()
+                        self.logger.info(f"  - Estratégia 2 Encontrados {len(file_links)} links (li.attachmentFile a)")
+                    
+                    # Estratégia 3 - Se não encontrou, tenta apenas li > a
+                    if not file_links:
+                        file_links = attachment_list.locator("li a").all()
+                        self.logger.info(f"  - Estratégia 3 Encontrados {len(file_links)} links (li a)")
+                    
+                    # Estratégia 4 - Se não encontrou, tenta todos os a dentro de ul
+                    if not file_links:
+                        file_links = attachment_list.locator("a").all()
+                        self.logger.info(f"  - Estratégia 4 Encontrados {len(file_links)} links (a)")
                     
                     for link in file_links:
                         try:
                             if not link.is_visible():
+                                self.logger.debug("Link não visível, pulando")
                                 continue
+                            
+                            # Verifica se o link está dentro de um attachmentText (não é arquivo)
+                            parent_li = link.locator("xpath=ancestor::li[1]").first
+                            if parent_li:
+                                parent_class = parent_li.get_attribute("class") or ""
+                                if "attachmentText" in parent_class:
+                                    self.logger.debug(f"Link está em attachmentText, pulando")
+                                    continue
+                            
                             href = link.get_attribute("href")
                             if not href:
+                                self.logger.debug("Link sem href, pulando")
                                 continue
+                            
                             text = (link.text_content() or "").strip()
+                            
+                            # Filtra links que têm apenas URLs como texto (como "www.coupa.com")
+                            if self._is_url_text(text):
+                                self.logger.debug(f"Link com URL como texto '{text}', pulando")
+                                continue
+                            
                             filename = text or Path(href).name
                             filename = filename.strip()
                             if not filename:
+                                self.logger.debug("Filename vazio, pulando")
                                 continue
+                            
                             # Normaliza nome
                             filename = re.sub(r'\s+', ' ', filename)
                             attachments.add(filename)
-                            self.logger.info(f"Anexo específico encontrado: {filename}")
+                            self.logger.info(f"✅ Anexo específico encontrado: {filename}")
                         except Exception as e:
                             self.logger.warning(f"Erro ao processar anexo da lista: {str(e)}")
                             continue
                 except Exception as e:
-                    self.logger.warning(f"Erro ao processar lista de anexos: {str(e)}")
+                    self.logger.warning(f"Erro ao processar lista de anexos ul.attachments__list: {str(e)}")
                     continue
             
-            # Estratégia 2: Busca anexos com seletores genéricos se não encontrou específicos
+            # Estratégia 1b: Busca alternativa - div.s-attachments (estrutura alternativa)
             if not attachments:
-                self.logger.info("Nenhum anexo encontrado na estrutura específica, tentando seletores genéricos")
+                self.logger.info("Tentando estratégia alternativa: div.s-attachments")
+                try:
+                    # Procura em todo o documento primeiro, depois no form
+                    attachment_divs = self.page.locator("div.s-attachments").all()
+                    if not attachment_divs:
+                        attachment_divs = form.locator("div.s-attachments").all()
+                    
+                    self.logger.info(f"Encontrados {len(attachment_divs)} divs de anexos (div.s-attachments)")
+                    
+                    for attachment_div in attachment_divs:
+                        try:
+                            # Busca links dentro do div de anexos
+                            file_links = attachment_div.locator("a").all()
+                            self.logger.info(f"Encontrados {len(file_links)} links dentro de div.s-attachments")
+                            
+                            for link in file_links:
+                                try:
+                                    if not link.is_visible():
+                                        continue
+                                    href = link.get_attribute("href")
+                                    if not href:
+                                        continue
+                                    text = (link.text_content() or "").strip()
+                                    # Filtra URLs
+                                    if self._is_url_text(text):
+                                        continue
+                                    filename = text or Path(href).name
+                                    filename = filename.strip()
+                                    if not filename:
+                                        continue
+                                    # Ignora textos genéricos
+                                    generic_texts = ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]
+                                    if filename.lower() in generic_texts:
+                                        continue
+                                    filename = re.sub(r'\s+', ' ', filename)
+                                    attachments.add(filename)
+                                    self.logger.info(f"Anexo de div.s-attachments encontrado: {filename}")
+                                except Exception as e:
+                                    continue
+                        except Exception as e:
+                            self.logger.warning(f"Erro ao processar div de anexos: {str(e)}")
+                            continue
+                except Exception as e:
+                    self.logger.warning(f"Erro na estratégia div.s-attachments: {str(e)}")
+            
+            # Estratégia 2: Busca em abas/sections (alguns itens têm anexos em abas)
+            if not attachments:
+                self.logger.info("Tentando expandir/acessar abas de anexos")
+                try:
+                    # Procura por abas ou buttons com 'attachment' ou 'anexo'
+                    tab_buttons = form.locator("button, a, div").filter(has_text="anexo").all()
+                    self.logger.info(f"Encontrados {len(tab_buttons)} possíveis abas/buttons de anexos")
+                    
+                    for button in tab_buttons[:3]:  # Tenta até 3
+                        try:
+                            button.click(timeout=2000)
+                            time.sleep(0.5)
+                            self.logger.info("Aba de anexos clicada")
+                        except:
+                            pass
+                except Exception as e:
+                    self.logger.warning(f"Erro ao tentar clicar em abas: {str(e)}")
+            
+            # Estratégia 3: Busca anexos com seletores genéricos se não encontrou específicos
+            if not attachments:
+                self.logger.info("Nenhum anexo encontrado, tentando seletores genéricos")
                 attachment_selectors = [
                     "a[href*='attachment']",
                     "a[href*='download']",
@@ -721,7 +910,10 @@ class ItemDataExtractor:
                 
                 for selector in attachment_selectors:
                     try:
-                        links = form.locator(selector).all()
+                        # Procura em todo o documento primeiro, depois no form
+                        links = self.page.locator(selector).all()
+                        if not links:
+                            links = form.locator(selector).all()
                         if links:
                             self.logger.info(f"Seletor '{selector}' encontrou {len(links)} links")
                         
@@ -733,6 +925,9 @@ class ItemDataExtractor:
                                 if not href:
                                     continue
                                 text = (link.text_content() or "").strip()
+                                # Filtra URLs
+                                if self._is_url_text(text):
+                                    continue
                                 filename = text or Path(href).name
                                 filename = filename.strip()
                                 if not filename:
@@ -754,12 +949,16 @@ class ItemDataExtractor:
                         self.logger.warning(f"Erro ao buscar anexos com seletor {selector}: {str(e)}")
                         continue
             
-            # Estratégia 3: Busca por qualquer link que pareça ser um anexo
+            # Estratégia 4: Busca por qualquer link que pareça ser um anexo
             if not attachments:
                 self.logger.info("Tentando busca por qualquer link que pareça anexo")
                 try:
-                    all_links = form.locator("a").all()
-                    self.logger.info(f"Total de links encontrados no formulário: {len(all_links)}")
+                    # Procura em todo o documento primeiro, depois no form
+                    all_links = self.page.locator("a").all()
+                    if not all_links:
+                        all_links = form.locator("a").all()
+                    
+                    self.logger.info(f"Total de links encontrados (doc/form): {len(all_links)}")
                     
                     for link in all_links:
                         try:
@@ -772,6 +971,9 @@ class ItemDataExtractor:
                             # Verifica se o href parece ser um arquivo
                             if any(ext in href.lower() for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.txt']):
                                 text = (link.text_content() or "").strip()
+                                # Filtra URLs
+                                if self._is_url_text(text):
+                                    continue
                                 filename = text or Path(href).name
                                 filename = filename.strip()
                                 if filename and filename.lower() not in ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]:
@@ -800,6 +1002,9 @@ class ItemDataExtractor:
                         
                         # Verifica se parece ser um anexo
                         if href and any(ext in href.lower() for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.jpg', '.png']):
+                            # Filtra URLs
+                            if self._is_url_text(text):
+                                continue
                             filename = text or Path(href).name
                             if filename and filename not in ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]:
                                 attachments.add(filename)
@@ -835,6 +1040,9 @@ class ItemDataExtractor:
                             if not href:
                                 continue
                             text = (link.text_content() or "").strip()
+                            # Filtra URLs
+                            if self._is_url_text(text):
+                                continue
                             filename = text or Path(href).name
                             filename = filename.strip()
                             if not filename:
@@ -884,6 +1092,9 @@ class ItemDataExtractor:
                                 if not href:
                                     continue
                                 text = (link.text_content() or "").strip()
+                                # Filtra URLs
+                                if self._is_url_text(text):
+                                    continue
                                 filename = text or Path(href).name
                                 filename = filename.strip()
                                 if not filename:
@@ -942,6 +1153,18 @@ class ItemDataExtractor:
     def _sanitize_filename(self, filename: str) -> str:
         """Remove caracteres inválidos do nome do arquivo"""
         return re.sub(r'[<>:"/\\|?*]', '_', filename)
+    
+    def _is_url_text(self, text: str) -> bool:
+        """Verifica se o texto é apenas uma URL (como 'www.coupa.com')"""
+        if not text:
+            return False
+        text_lower = text.lower()
+        # Filtra URLs e domínios
+        return ("www." in text_lower or 
+                "coupa" in text_lower or 
+                text_lower.startswith("http") or
+                ".com" in text_lower or 
+                ".br" in text_lower)
     
     def _is_valid_item(self, item: ExtractedItemData) -> bool:
         """Verifica se o item tem dados válidos"""
@@ -1014,6 +1237,7 @@ class ItemDataExtractor:
             descricao="",
             descricao_estendida="",
             quantidade="",
+            unidade="",
             data_necessaria="",
             detalhes="",
             arquivos_anexados="",
@@ -1148,7 +1372,7 @@ class DataExporter:
     def __init__(self):
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         self.duplicate_processor = DuplicateProcessor()
-
+    
     def export_to_excel(self, data: List[Dict[str, str]], filename: str) -> bool:
         """Exporta dados para Excel (.xlsx) usando openpyxl puro com formatação adequada"""
         if not data:
@@ -1165,8 +1389,25 @@ class DataExporter:
             ws = wb.active
             ws.title = "Cotações"
             
-            # Cabeçalho
+            # Cabeçalho - ordena para que unidade apareça logo após quantidade
             headers = list(filtered_data[0].keys())
+            # Define ordem preferencial das colunas
+            preferred_order = [
+                'evento', 'numero_evento', 'nome_evento', 'data_inicial', 'data_final', 'resposta',
+                'numero_item', 'codigo_item', 'descricao', 'descricao_estendida', 
+                'quantidade', 'unidade', 'data_necessaria', 'detalhes', 
+                'arquivos_anexados', 'ncm', 'numero_planta', 'estado_planta'
+            ]
+            # Ordena headers mantendo a ordem preferencial e adicionando outros campos no final
+            ordered_headers = []
+            for col in preferred_order:
+                if col in headers:
+                    ordered_headers.append(col)
+            # Adiciona campos que não estão na ordem preferencial
+            for col in headers:
+                if col not in ordered_headers:
+                    ordered_headers.append(col)
+            headers = ordered_headers
             ws.append(headers)
             
             # Estilo para cabeçalho
@@ -1189,6 +1430,16 @@ class DataExporter:
                 for col_idx, header in enumerate(headers, start=1):
                     cell = ws.cell(row=row_idx, column=col_idx)
                     value = row_data.get(header, "")
+                    
+                    # Limpa campo de anexos se contiver apenas www.coupa.com ou variações
+                    if header == 'arquivos_anexados' and value:
+                        # Remove "www.coupa.com" e variações
+                        value_clean = value.replace("www.coupa.com", "").strip()
+                        # Remove também se for apenas domínios
+                        value_clean = value_clean.replace("coupa.com", "").strip()
+                        value_clean = value_clean.replace("www.coupa", "").strip()
+                        # Remove valores vazios após limpeza
+                        value = value_clean if value_clean else ""
                     
                     # Aplica formatação baseada no tipo de campo
                     if self._is_numeric_field(header, value):
@@ -1241,6 +1492,9 @@ class DataExporter:
             'evento', 'numero_evento', 'codigo_item', 'quantidade',
             'numero_planta', 'ncm'
         ]
+        # Unidade nunca é numérica
+        if header.lower() == 'unidade':
+            return False
         return header.lower() in numeric_headers and value.strip()
     
     def _is_date_field(self, header: str, value: str) -> bool:
@@ -1309,18 +1563,25 @@ class AuthenticationService:
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
     
     def authenticate(self, page: Page, username: str, password: str) -> bool:
-        """Realiza autenticação na plataforma"""
+        """Realiza autenticação na plataforma (suporta FERROSOS e METALS)"""
         try:
             login_url = f"{self.config.base_url}{self.config.login_path}"
             page.goto(login_url)
             time.sleep(2)
-            if not self._is_login_page(page):
+            
+            # Detecta qual plataforma está sendo usada
+            is_metals = self.config.source == CouperSource.METALS
+            self.logger.info(f"Detectada plataforma: {'METALS' if is_metals else 'FERROSOS'}")
+            
+            if not self._is_login_page(page, is_metals):
                 self.logger.error("Não foi possível acessar a página de login")
                 return False
-            self._fill_credentials(page, username, password)
-            self._submit_login_form(page)
+            
+            self._fill_credentials(page, username, password, is_metals)
+            self._submit_login_form(page, is_metals)
+            
             # Verifica sucesso
-            if not self._verify_authentication(page):
+            if not self._verify_authentication(page, is_metals):
                 self.logger.error("Usuário ou senha incorretos!")
                 return "login_error"
             return True
@@ -1328,26 +1589,81 @@ class AuthenticationService:
             self.logger.error(f"Erro na autenticação: {str(e)}")
             return False
     
-    def _is_login_page(self, page: Page) -> bool:
+    def _is_login_page(self, page: Page, is_metals: bool = False) -> bool:
         """Verifica se está na página de login"""
-        return ("supplier_login" in page.url or 
-                page.get_by_role("button", name="Signin").count() > 0)
+        if is_metals:
+            # METALS: verifica por elementos específicos
+            return (
+                "login" in page.url.lower() or
+                page.locator("#user_login").count() > 0 or
+                page.locator("#login_button").count() > 0
+            )
+        else:
+            # FERROSOS: verifica por elementos da Coupa padrão
+            return (
+                "supplier_login" in page.url or 
+                page.get_by_role("button", name="Signin").count() > 0
+            )
     
-    def _fill_credentials(self, page: Page, username: str, password: str) -> None:
-        """Preenche as credenciais de login"""
-        page.get_by_role("textbox", name="Nome de usuário ou endereço").fill(username)
-        page.get_by_role("textbox", name="Senha").fill(password)
+    def _fill_credentials(self, page: Page, username: str, password: str, is_metals: bool = False) -> None:
+        """Preenche as credenciais de login (detecta plataforma)"""
+        if is_metals:
+            # METALS: usa IDs específicos
+            try:
+                page.locator("#user_login").fill(username)
+                self.logger.info("Username preenchido (METALS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao preencher username METALS: {str(e)}")
+            
+            try:
+                page.locator("#user_password").fill(password)
+                self.logger.info("Password preenchido (METALS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao preencher password METALS: {str(e)}")
+        else:
+            # FERROSOS: usa roles
+            try:
+                page.get_by_role("textbox", name="Nome de usuário ou endereço").fill(username)
+                self.logger.info("Username preenchido (FERROSOS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao preencher username FERROSOS: {str(e)}")
+            
+            try:
+                page.get_by_role("textbox", name="Senha").fill(password)
+                self.logger.info("Password preenchido (FERROSOS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao preencher password FERROSOS: {str(e)}")
     
-    def _submit_login_form(self, page: Page) -> None:
+    def _submit_login_form(self, page: Page, is_metals: bool = False) -> None:
         """Submete o formulário de login"""
-        page.get_by_role("button", name="Signin").click()
+        if is_metals:
+            # METALS: clica no botão por ID
+            try:
+                page.locator("#login_button").click()
+                self.logger.info("Botão login clicado (METALS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao clicar botão METALS: {str(e)}")
+        else:
+            # FERROSOS: clica no botão por role
+            try:
+                page.get_by_role("button", name="Signin").click()
+                self.logger.info("Botão login clicado (FERROSOS)")
+            except Exception as e:
+                self.logger.warning(f"Erro ao clicar botão FERROSOS: {str(e)}")
+        
         time.sleep(3)
     
-    def _verify_authentication(self, page: Page) -> bool:
+    def _verify_authentication(self, page: Page, is_metals: bool = False) -> bool:
         """Verifica se a autenticação foi bem-sucedida"""
-        if "supplier_login" in page.url:
-            self.logger.error("Login falhou")
-            return False
+        # Verifica se voltou para login (falha)
+        if is_metals:
+            if "login" in page.url.lower() and page.locator("#user_login").count() > 0:
+                self.logger.error("Login falhou (METALS)")
+                return False
+        else:
+            if "supplier_login" in page.url:
+                self.logger.error("Login falhou (FERROSOS)")
+                return False
         
         # Tenta acessar página de cotações
         quotes_url = f"{self.config.base_url}{self.config.quotes_path}"
@@ -1357,6 +1673,8 @@ class AuthenticationService:
         success = "quote_supplier_land" in page.url
         if not success:
             self.logger.error("Falha ao acessar página de cotações")
+        else:
+            self.logger.info(f"Login bem-sucedido para {'METALS' if is_metals else 'FERROSOS'}")
         
         return success
 
@@ -1580,7 +1898,7 @@ class QuoteCrawler:
         self.logger.info(f"Procurando cotações para data: {target_date}")
         self.logger.info("Parando quando encontrar data inferior (tabela ordenada decrescente)")
         
-        while True and not found_older_date:
+        while True:
             try:
                 self.logger.info(f"Verificando página {current_page}...")
                 
@@ -1649,7 +1967,7 @@ class QuoteCrawler:
                 if not self._go_to_next_page(page):
                     self.logger.info("Não há próxima página, finalizando listagem")
                     break
-                
+                    
                 current_page += 1
                 
                 # Aguarda carregamento da nova página
@@ -1658,7 +1976,7 @@ class QuoteCrawler:
             except Exception as e:
                 self.logger.error(f"Erro ao processar página {current_page}: {str(e)}")
                 break
-        
+                    
         # Log final da listagem
         self.logger.info("=== RESUMO DA LISTAGEM OTIMIZADA ===")
         self.logger.info(f"Total de páginas verificadas: {total_pages_checked}")
@@ -1889,11 +2207,11 @@ class QuoteCrawler:
             cells = row.locator("td")
             if cells.count() < 7:
                 return None
-                
+            
             evento_link = cells.nth(0).locator("a")
             if evento_link.count() == 0:
                 return None
-                
+            
             evento = evento_link.text_content(timeout=3000).strip()
             raw_nome_evento = cells.nth(1).text_content(timeout=3000).strip()
             numero_evento, nome_evento_limpo = self._split_numero_nome_evento(raw_nome_evento)
@@ -1981,7 +2299,7 @@ class QuoteCrawler:
                 self.logger.error(f"Falha na navegação para cotação {quote_data['evento']}. {error_msg}")
                 self._save_failed_quote(quote_data, error_msg)
                 return False
-
+            
             # Verifica se é uma página de lista de respostas e navega para a primeira resposta
             if self._is_quote_with_responses_page(page):
                 self.logger.info(f"Cotação {quote_data['evento']} é do tipo 'com respostas' - navegando para primeira resposta")
@@ -1992,6 +2310,13 @@ class QuoteCrawler:
                     return False
                 # Aguarda carregamento da página da resposta
                 time.sleep(3)
+            
+            # Se for METALS, precisa clicar em "Editar" após entrar na página de resposta
+            if self.config.source == CouperSource.METALS:
+                self.logger.info(f"Plataforma METALS - tentando clicar em 'Editar'")
+                if not self._click_edit_button_metals(page):
+                    self.logger.warning(f"Não conseguiu encontrar botão 'Editar' para METALS, continuando mesmo assim")
+                time.sleep(2)
 
             # Atualiza status
             self._update_status(f"🔍 Extraindo itens da cotação {quote_data['evento']}...")
@@ -2096,10 +2421,72 @@ class QuoteCrawler:
             self.logger.error(f"Erro ao navegar para primeira resposta: {str(e)}")
             return False
     
+    def _click_edit_button_metals(self, page: Page) -> bool:
+        """Clica no botão 'Editar' para METALS (depois de entrar na página de resposta)"""
+        try:
+            # Estratégia 1: Procura por link de "Editar" na página (pode estar na tabela de ações)
+            edit_links = page.locator("a[href*='/edit']").all()
+            self.logger.info(f"Estratégia 1 - Encontrados {len(edit_links)} links com '/edit'")
+            
+            if edit_links:
+                for link in edit_links:
+                    try:
+                        if link.is_visible():
+                            title = link.get_attribute("title") or ""
+                            aria_label = link.get_attribute("aria-label") or ""
+                            
+                            if "editar" in title.lower() or "editar" in aria_label.lower() or "edit" in title.lower():
+                                self.logger.info("✅ Botão 'Editar' encontrado - clicando")
+                                link.click(timeout=5000)
+                                return True
+                    except Exception as e:
+                        self.logger.debug(f"Erro ao tentar clicar link: {str(e)}")
+                        continue
+            
+            # Estratégia 2: Procura por imagem com class "sprite-pencil" (ícone de lápis = editar)
+            pencil_icons = page.locator("img.sprite-pencil").all()
+            self.logger.info(f"Estratégia 2 - Encontrados {len(pencil_icons)} ícones de lápis (editar)")
+            
+            if pencil_icons:
+                for icon in pencil_icons:
+                    try:
+                        if icon.is_visible():
+                            parent_link = icon.locator("xpath=parent::a").first
+                            if parent_link.count() > 0:
+                                self.logger.info("✅ Clicando em link com ícone de lápis")
+                                parent_link.click(timeout=5000)
+                                return True
+                    except Exception as e:
+                        self.logger.debug(f"Erro ao clicar ícone de lápis: {str(e)}")
+                        continue
+            
+            # Estratégia 3: Procura por qualquer link/botão com "edit" na URL
+            all_links = page.locator("a").all()
+            self.logger.info(f"Estratégia 3 - Procurando em {len(all_links)} links")
+            
+            for link in all_links:
+                try:
+                    if link.is_visible():
+                        href = link.get_attribute("href") or ""
+                        if "/edit" in href.lower():
+                            self.logger.info(f"✅ Clicando em link de edição: {href}")
+                            link.click(timeout=5000)
+                            return True
+                except Exception:
+                    continue
+            
+            self.logger.warning("⚠️ Não encontrou botão 'Editar' para METALS")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao procurar botão 'Editar': {str(e)}")
+            return False
+    
     def _generate_filename(self) -> str:
-        """Gera nome do arquivo com timestamp"""
+        """Gera nome do arquivo com timestamp e plataforma"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"dados_cotacoes_{timestamp}.csv"
+        plataforma = "METALS" if self.config.source == CouperSource.METALS else "FERROSOS"
+        return f"dados_cotacoes_{plataforma}_{timestamp}.csv"
 
     def _is_date_older_than_target(self, date_to_check: str, target_date: str) -> bool:
         """Verifica se uma data é inferior à data desejada (para otimizar busca em tabela ordenada)"""
@@ -2276,6 +2663,23 @@ class CrawlerGUI:
         self.data_exporter = DataExporter()
         self.processed_quotes = 0
         
+        # Inicializa gerenciador de credenciais
+        self.credentials_manager = None
+        if not _CREDENTIALS_MANAGER_AVAILABLE:
+            error_msg = f"Módulo credentials_manager não está disponível"
+            if _CREDENTIALS_MANAGER_IMPORT_ERROR:
+                error_msg += f" (erro: {_CREDENTIALS_MANAGER_IMPORT_ERROR})"
+            self.logger.warning(error_msg)
+            self.logger.warning("Certifique-se de que as dependências estão instaladas: pip install keyring cryptography pydantic")
+        elif CredentialsManager:
+            try:
+                self.credentials_manager = CredentialsManager(use_windows_keyring=True)
+                self.logger.info("Gerenciador de credenciais inicializado com sucesso")
+            except Exception as e:
+                self.logger.error(f"Erro ao inicializar o gerenciador de credenciais: {str(e)}", exc_info=True)
+        else:
+            self.logger.warning("CredentialsManager é None após import bem-sucedido")
+        
         self._setup_ui()
     
     def _setup_ui(self) -> None:
@@ -2304,6 +2708,27 @@ class CrawlerGUI:
         ttk.Label(header, text="📝 Extrator de Cotações Vale Coupa", style="Title.TLabel").pack(anchor="center")
         ttk.Label(header, text="Sistema automatizado para extração de dados de cotações", font=("Segoe UI", 10), background="#fff").pack(anchor="center")
 
+        # Seleção de Fonte (Ferrosos ou Metals)
+        source_frame = ttk.Labelframe(self.root, text="🏭 Selecione a Plataforma", style="Card.TLabelframe")
+        source_frame.pack(padx=20, pady=(10, 10), fill="x")
+        
+        self.source_var = tk.StringVar(value=CouperSource.FERROSOS.value)
+        ttk.Radiobutton(
+            source_frame,
+            text="FERROSOS (vale.coupahost.com)",
+            variable=self.source_var,
+            value=CouperSource.FERROSOS.value,
+            style="TRadiobutton"
+        ).pack(anchor="w", padx=8, pady=5)
+        
+        ttk.Radiobutton(
+            source_frame,
+            text="METALS (valebasemetals.coupahost.com)",
+            variable=self.source_var,
+            value=CouperSource.METALS.value,
+            style="TRadiobutton"
+        ).pack(anchor="w", padx=8, pady=5)
+
         # Card principal (inputs lado a lado)
         main_card = ttk.Frame(self.root, style="Card.TFrame")
         main_card.pack(padx=20, pady=10, fill="x")
@@ -2319,6 +2744,28 @@ class CrawlerGUI:
         ttk.Label(cred_frame, text="Senha:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
         self.password_var = tk.StringVar()
         ttk.Entry(cred_frame, textvariable=self.password_var, show="*", style="TEntry").grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        
+        # Checkbox para lembrar credenciais
+        self.remember_var = tk.BooleanVar(value=False)
+        remember_checkbox = ttk.Checkbutton(
+            cred_frame,
+            text="Lembrar credenciais nesta máquina",
+            variable=self.remember_var,
+            style="Info.TLabel"
+        )
+        remember_checkbox.grid(row=4, column=0, sticky="w", padx=8, pady=(5, 0))
+        
+        # Botão para limpar credenciais salvas
+        clear_credentials_btn = ttk.Button(
+            cred_frame,
+            text="🗑️ Limpar credenciais salvas",
+            command=self._clear_saved_credentials
+        )
+        clear_credentials_btn.grid(row=5, column=0, sticky="w", padx=8, pady=(5, 8))
+        
+        # Carrega credenciais salvas após a UI estar totalmente renderizada
+        # Usa after_idle para garantir que a UI está completamente inicializada
+        self.root.after_idle(self._load_saved_credentials)
 
         # Coluna 2: Configurações
         config_frame = ttk.Labelframe(main_card, text="⚙️ Configurações de Extração", style="Card.TLabelframe")
@@ -2370,70 +2817,6 @@ class CrawlerGUI:
         ttk.Label(status_card, textvariable=self.status_var, foreground="#22bb55", font=("Segoe UI", 11, "bold"), background="#fff").pack(anchor="w", padx=8, pady=(8, 5))
         ttk.Label(status_card, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8), background="#fff").pack(anchor="w", padx=8, pady=(0, 8))
     
-    def _configure_styles(self) -> None:
-        """Configura estilos da interface"""
-        style = ttk.Style()
-        
-        # Cores modernas
-        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("Header.TLabel", background="#ffffff", font=("Segoe UI", 16, "bold"), foreground="#2c3e50")
-        style.configure("Section.TLabel", background="#ffffff", font=("Segoe UI", 11, "bold"), foreground="#34495e")
-        style.configure("Info.TLabel", background="#ffffff", font=("Segoe UI", 9), foreground="#7f8c8d")
-        style.configure("Status.TLabel", background="#ffffff", font=("Segoe UI", 10), foreground="#27ae60")
-    
-    def _create_header(self, parent) -> None:
-        """Cria cabeçalho da aplicação"""
-        header_frame = ttk.Frame(parent, style="Card.TFrame")
-        header_frame.pack(fill="x", pady=(0, 30))
-        
-        title = ttk.Label(header_frame, text="🔍 Extrator de Cotações Vale Coupa", style="Header.TLabel")
-        title.pack(pady=10)
-        
-        subtitle = ttk.Label(header_frame, text="Sistema automatizado para extração de dados de cotações", style="Info.TLabel")
-        subtitle.pack()
-    
-    def _create_login_section(self, parent) -> None:
-        """Cria seção de login"""
-        login_frame = ttk.LabelFrame(parent, text="🔐 Credenciais de Acesso", style="Card.TFrame")
-        login_frame.pack(fill="x", pady=(0, 20))
-        
-        # Grid interno
-        grid_frame = ttk.Frame(login_frame)
-        grid_frame.pack(padx=20, pady=20, fill="x")
-        
-        # Usuário
-        ttk.Label(grid_frame, text="Usuário:", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.username_var = tk.StringVar()
-        username_entry = ttk.Entry(grid_frame, textvariable=self.username_var, width=30, font=("Segoe UI", 10))
-        username_entry.grid(row=0, column=1, sticky="ew", pady=5)
-        
-        # Senha
-        ttk.Label(grid_frame, text="Senha:", style="Section.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.password_var = tk.StringVar()
-        password_entry = ttk.Entry(grid_frame, textvariable=self.password_var, show="*", width=30, font=("Segoe UI", 10))
-        password_entry.grid(row=1, column=1, sticky="ew", pady=5)
-        
-        grid_frame.columnconfigure(1, weight=1)
-    
-    def _create_date_section(self, parent) -> None:
-        """Cria seção de seleção de data"""
-        date_frame = ttk.LabelFrame(parent, text="📅 Data para Extração", style="Card.TFrame")
-        date_frame.pack(fill="x", pady=(0, 20))
-        
-        inner_frame = ttk.Frame(date_frame)
-        inner_frame.pack(padx=20, pady=20, fill="x")
-        
-        ttk.Label(inner_frame, text="Data (DD/MM/YY):", style="Section.TLabel").pack(anchor="w")
-        
-        date_input_frame = ttk.Frame(inner_frame)
-        date_input_frame.pack(anchor="w", pady=(5, 0))
-        
-        self.date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%y"))
-        date_entry = ttk.Entry(date_input_frame, textvariable=self.date_var, width=15, font=("Segoe UI", 10))
-        date_entry.pack(side="left")
-        
-        ttk.Label(date_input_frame, text="  Exemplo: 25/12/24", style="Info.TLabel").pack(side="left")
-    
     def _create_action_section(self, parent) -> None:
         """Cria seção de ações"""
         action_frame = ttk.Frame(parent, style="Card.TFrame")
@@ -2476,6 +2859,16 @@ class CrawlerGUI:
         if not self._validate_inputs(username, password, date):
             return
         
+        # Cria config com a fonte selecionada
+        source_str = self.source_var.get()
+        selected_source = CouperSource.METALS if source_str == CouperSource.METALS.value else CouperSource.FERROSOS
+        self.config = CrawlerConfig(source=selected_source)
+        self.crawler = QuoteCrawler(self.config)
+        
+        # Log da plataforma selecionada
+        plataforma = "METALS" if selected_source == CouperSource.METALS else "FERROSOS"
+        self.logger.info(f"Iniciando extração de {plataforma}")
+        
         # Reset das variáveis de controle
         self.stop_extraction = False
         self.current_quote = ""
@@ -2490,7 +2883,7 @@ class CrawlerGUI:
         self.stop_button.config(state="normal")
         self.progress_bar['value'] = 0
         self.progress_label.config(text="")
-        self.status_var.set("🔄 Processando...")
+        self.status_var.set(f"🔄 Processando ({plataforma})...")
         self.root.update()
         
         import threading
@@ -2539,6 +2932,52 @@ class CrawlerGUI:
             time.sleep(2)
             self._show_error_and_close("Nenhum dado foi extraído antes de parar a execução.")
     
+    def _load_saved_credentials(self) -> None:
+        """Carrega credenciais salvas se existirem"""
+        try:
+            # Verifica se o gerenciador está disponível
+            if not self.credentials_manager:
+                self.logger.debug("Gerenciador de credenciais não disponível")
+                return
+            
+            # Garante que as variáveis estão inicializadas
+            if not (hasattr(self, 'username_var') and hasattr(self, 'password_var') and hasattr(self, 'remember_var')):
+                self.logger.warning("Variáveis de interface não inicializadas ainda, tentando novamente...")
+                # Tenta novamente após um pequeno delay
+                self.root.after(200, self._load_saved_credentials)
+                return
+            
+            # Tenta carregar as credenciais diretamente
+            credentials = self.credentials_manager.load_credentials()
+            if credentials and credentials.is_valid():
+                self.username_var.set(credentials.username)
+                self.password_var.set(credentials.password)
+                self.remember_var.set(True)
+                self.logger.info(f"Credenciais salvas carregadas com sucesso para: {credentials.username}")
+            else:
+                self.logger.debug("Nenhuma credencial salva encontrada ou credenciais inválidas")
+        except Exception as e:
+            self.logger.warning(f"Erro ao carregar credenciais salvas: {str(e)}", exc_info=True)
+    
+    def _clear_saved_credentials(self) -> None:
+        """Limpa credenciais salvas"""
+        if not self.credentials_manager:
+            messagebox.showwarning("Aviso", "Gerenciador de credenciais não disponível")
+            return
+        
+        if not self.credentials_manager.has_saved_credentials():
+            messagebox.showinfo("Informação", "Não existem credenciais salvas")
+            return
+        
+        if messagebox.askyesno("Confirmação", "Deseja remover as credenciais salvas?"):
+            if self.credentials_manager.delete_credentials():
+                self.username_var.set("")
+                self.password_var.set("")
+                self.remember_var.set(False)
+                messagebox.showinfo("Sucesso", "Credenciais removidas com sucesso")
+            else:
+                messagebox.showerror("Erro", "Falha ao remover credenciais")
+    
     def _validate_inputs(self, username: str, password: str, date: str) -> bool:
         """Valida entradas do usuário"""
         if not username or not password:
@@ -2555,6 +2994,18 @@ class CrawlerGUI:
         """Executa a extração em thread separada"""
         try:
             self.root.after(0, lambda: self.status_var.set("🔐 Conectando..."))
+            
+            # Salva credenciais se o checkbox foi marcado
+            if self.remember_var.get() and self.credentials_manager:
+                try:
+                    if self.credentials_manager.save_credentials(username, password):
+                        self.logger.info("Credenciais salvas com sucesso")
+                    else:
+                        self.logger.warning("Falha ao salvar credenciais")
+                except Exception as e:
+                    self.logger.warning(f"Erro ao salvar credenciais: {str(e)}")
+            
+            # Cria um crawler com callback de status
             crawler = QuoteCrawler(self.config)
             
             def update_status(message):
@@ -2632,9 +3083,10 @@ class CrawlerGUI:
         self.root.destroy()
     
     def _generate_filename(self) -> str:
-        """Gera nome do arquivo baseado na data atual"""
+        """Gera nome do arquivo baseado na data atual e plataforma"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"cotacoes_extraidas_{timestamp}.xlsx"
+        plataforma = "METALS" if self.config.source == CouperSource.METALS else "FERROSOS"
+        return f"cotacoes_extraidas_{plataforma}_{timestamp}.xlsx"
     
     def run(self) -> None:
         """Executa a aplicação"""

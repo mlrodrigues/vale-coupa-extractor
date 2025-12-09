@@ -24,6 +24,11 @@ Na tela que abrir, você verá campos para:
 **🔐 Credenciais de Acesso**
 - **Usuário**: Digite seu nome de usuário da plataforma Vale Coupa
 - **Senha**: Digite sua senha (ficará oculta por segurança)
+- **Lembrar credenciais**: 
+  - ✅ Marque esta opção se deseja que o programa salve suas credenciais
+  - Na próxima vez que abrir o programa, seus dados já estarão preenchidos automaticamente
+  - As credenciais são armazenadas de forma criptografada e segura
+  - Se deseja remover as credenciais salvas, clique no botão "🗑️ Limpar credenciais salvas"
 
 ### 3. Escolher a data
 **📅 Data para Extração**
@@ -88,11 +93,28 @@ Este arquivo pode ser aberto no **Excel** ou **Google Sheets** e contém todas a
 - Na aba "Geral", marque "Desbloquear" (se aparecer)
 - Clique "OK" e tente novamente
 
+### Dúvidas sobre credenciais salvas
+
+**P: As minhas credenciais são seguras?**
+R: Sim! As credenciais são armazenadas usando criptografia e o Windows Credential Manager. São tão seguras quanto as senhas salvas no seu navegador.
+
+**P: Como removo as credenciais salvas?**
+R: Clique no botão "🗑️ Limpar credenciais salvas" na tela de login. Você pode confirmar a exclusão.
+
+**P: E se eu estou usando um computador compartilhado?**
+R: ⚠️ **Não recomendamos salvar credenciais em computadores compartilhados**. Clique em "Limpar credenciais salvas" depois de usar.
+
+**P: Posso desativar a opção de salvar credenciais?**
+R: Sim! Basta **desmarcar** a opção "Lembrar credenciais nesta máquina" e suas credenciais não serão salvas naquele login.
+
 ## 🛡️ Segurança
 
-- O programa **NÃO salva** suas credenciais
-- Todas as senhas são mantidas apenas na memória durante o uso
-- O programa se conecta diretamente com a plataforma Vale Coupa (mesma que você usa no navegador)
+- ✅ O programa agora pode **salvar suas credenciais de forma segura** (opcional)
+- 🔒 As senhas são criptografadas usando o Windows Credential Manager ou encriptação local
+- 🔑 Você pode optar por não salvar as credenciais (marcando/desmarcando a opção)
+- 🗑️ Existe botão para **limpar credenciais salvas** a qualquer momento
+- 📱 O programa se conecta diretamente com a plataforma Vale Coupa (mesma que você usa no navegador)
+- 🚫 As credenciais são armazenadas de forma segura no seu computador (Windows Credential Manager)
 
 ## ⏱️ Tempo de execução
 
