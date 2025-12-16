@@ -2750,8 +2750,7 @@ class CrawlerGUI:
         remember_checkbox = ttk.Checkbutton(
             cred_frame,
             text="Lembrar credenciais nesta máquina",
-            variable=self.remember_var,
-            style="Info.TLabel"
+            variable=self.remember_var
         )
         remember_checkbox.grid(row=4, column=0, sticky="w", padx=8, pady=(5, 0))
         
