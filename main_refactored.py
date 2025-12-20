@@ -146,6 +146,20 @@ def setup_playwright_environment():
 # Configura ambiente antes de importar o Playwright
 setup_playwright_environment()
 
+def sanitize_filename_component(value: str, max_len: int = 40) -> str:
+    """Sanitiza um trecho para ser usado em nome de arquivo (Windows-safe)."""
+    value = (value or "").strip()
+    if not value:
+        return "sem_login"
+    # Usa apenas a parte antes do '@' (tudo depois pode ser ignorado)
+    if "@" in value:
+        value = value.split("@", 1)[0]
+    # Troca caracteres problemáticos e normaliza espaços
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r'[<>:"/\\|?*]', "_", value)
+    # Limita tamanho para evitar nomes enormes
+    return value[:max_len] if len(value) > max_len else value
+
 class LogLevel(Enum):
     """Níveis de log disponíveis"""
     DEBUG = "DEBUG"
@@ -183,6 +197,12 @@ class CrawlerConfig:
     retry_delay_base_ms: int = 2000  # Delay base para retry (2 segundos)
     quote_navigation_timeout_ms: int = 20000  # Timeout específico para navegação de cotações
     response_navigation_timeout_ms: int = 15000  # Timeout para navegação de respostas
+
+@dataclass(frozen=True)
+class ExportMetadata:
+    """Metadados para rastreabilidade do arquivo exportado (SOLID: passa contexto sem acoplar DataExporter à UI)."""
+    username: str
+    source: CouperSource
     
 class ExtractedItemData(TypedDict):
     """Estrutura dos dados extraídos de um item"""
@@ -484,7 +504,8 @@ class ItemDataExtractor:
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         self.numero_evento = numero_evento or "sem_numero"
         self.anexos_dir = Path("anexos") / str(self.numero_evento)
-        self.anexos_dir.mkdir(parents=True, exist_ok=True)
+        # Importante: NÃO cria a pasta aqui.
+        # Pastas só devem existir quando houver ao menos 1 anexo baixado com sucesso.
     
     def extract_all_items(self) -> List[ExtractedItemData]:
         """Extrai dados de todos os itens da página"""
@@ -1025,14 +1046,57 @@ class ItemDataExtractor:
         """Faz download dos anexos de um item específico"""
         try:
             self.logger.info(f"Tentando fazer download dos anexos do item {index + 1}")
-            
-            # Busca anexos na estrutura específica do Vale Coupa
-            attachment_lists = form.locator("ul.attachments__list.s-attachmentList").all()
-            for attachment_list in attachment_lists:
-                try:
-                    # Busca links dentro da lista de anexos
-                    file_links = attachment_list.locator("li.attachment.attachmentFile.s-attachmentFile a").all()
-                    for link in file_links:
+
+            # Importante: alguns layouts do Coupa renderizam anexos FORA do form do item.
+            # Então tentamos primeiro no form e depois no documento (page).
+            scopes = [("form", form), ("page", self.page)]
+
+            seen: set[tuple[str, str]] = set()
+            downloaded = 0
+
+            for scope_name, scope in scopes:
+                links = self._collect_attachment_links(scope)
+                if links:
+                    self.logger.info(f"Escopo {scope_name}: {len(links)} links candidatos a anexo")
+
+                for href, text in links:
+                    try:
+                        filename = self._choose_attachment_filename(text, href)
+                        if not filename:
+                            continue
+
+                        key = (href, filename)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        if self._download_file(href, filename):
+                            downloaded += 1
+                            self.logger.info(f"Anexo baixado com sucesso: {filename}")
+                        else:
+                            self.logger.warning(f"Falha ao baixar anexo: {filename}")
+                    except Exception as e:
+                        self.logger.warning(f"Erro ao processar anexo para download: {str(e)}")
+                        continue
+
+            if downloaded == 0:
+                self.logger.info(f"Nenhum anexo baixado para o item {index + 1}")
+                        
+        except Exception as e:
+            self.logger.error(f"Erro ao fazer download dos anexos do item {index + 1}: {str(e)}")
+
+    def _collect_attachment_links(self, scope) -> list[tuple[str, str]]:
+        """Coleta links candidatos a anexos dentro de um escopo (form ou page)."""
+        results: list[tuple[str, str]] = []
+        try:
+            # 1) Estrutura específica (listas de anexos)
+            attachment_lists = scope.locator("ul.attachments__list.s-attachmentList").all()
+            if not attachment_lists:
+                attachment_lists = scope.locator("ul.attachments__list").all()
+
+            if attachment_lists:
+                for ul in attachment_lists:
+                    for link in ul.locator("a").all():
                         try:
                             if not link.is_visible():
                                 continue
@@ -1040,110 +1104,103 @@ class ItemDataExtractor:
                             if not href:
                                 continue
                             text = (link.text_content() or "").strip()
-                            # Filtra URLs
-                            if self._is_url_text(text):
-                                continue
-                            filename = text or Path(href).name
-                            filename = filename.strip()
-                            if not filename:
-                                continue
-                            
-                            # Normaliza nome
-                            filename = re.sub(r'\s+', ' ', filename)
-                            
-                            # Faz o download
-                            if self._download_file(href, filename):
-                                self.logger.info(f"Anexo baixado com sucesso: {filename}")
-                            else:
-                                self.logger.warning(f"Falha ao baixar anexo: {filename}")
-                                
-                        except Exception as e:
-                            self.logger.warning(f"Erro ao processar anexo para download: {str(e)}")
+                            results.append((href, text))
+                        except Exception:
                             continue
-                except Exception as e:
-                    self.logger.warning(f"Erro ao processar lista de anexos para download: {str(e)}")
-                    continue
-            
-            # Se não encontrou anexos na estrutura específica, busca com seletores genéricos
-            if not attachment_lists:
-                attachment_selectors = [
-                    "a[href*='attachment']",
-                    "a[href*='download']",
-                    "a[href*='file']",
-                    "a[href*='document']",
-                    "a[href*='.pdf']",
-                    "a[href*='.doc']",
-                    "a[href*='.docx']",
-                    "a[href*='.xls']",
-                    "a[href*='.xlsx']",
-                    "a[href*='.zip']",
-                    "a[href*='.rar']",
-                    "a[download]",
-                    "a[target='_blank']"
-                ]
-                for selector in attachment_selectors:
-                    try:
-                        links = form.locator(selector).all()
-                        for link in links:
-                            try:
-                                if not link.is_visible():
-                                    continue
-                                href = link.get_attribute("href")
-                                if not href:
-                                    continue
-                                text = (link.text_content() or "").strip()
-                                # Filtra URLs
-                                if self._is_url_text(text):
-                                    continue
-                                filename = text or Path(href).name
-                                filename = filename.strip()
-                                if not filename:
-                                    continue
-                                
-                                # Ignora textos genéricos
-                                generic_texts = ["anexos", "chment", "download", "arquivo", "file", "documento", "clique aqui", "open", "abrir"]
-                                if filename.lower() in generic_texts:
-                                    continue
-                                
-                                # Normaliza nome
-                                filename = re.sub(r'\s+', ' ', filename)
-                                
-                                # Faz o download
-                                if self._download_file(href, filename):
-                                    self.logger.info(f"Anexo baixado com sucesso: {filename}")
-                                else:
-                                    self.logger.warning(f"Falha ao baixar anexo: {filename}")
-                                    
-                            except Exception as e:
-                                self.logger.warning(f"Erro ao processar anexo individual para download: {str(e)}")
+                return results
+
+            # 2) Fallback genérico (qualquer link com cara de download/anexo)
+            attachment_selectors = [
+                "a[href*='attachment']",
+                "a[href*='download']",
+                "a[href*='file']",
+                "a[href*='document']",
+                "a[download]",
+                "a[target='_blank']",
+                # extensões comuns (não é filtro exclusivo; só aumenta recall)
+                "a[href*='.pdf']",
+                "a[href*='.doc']",
+                "a[href*='.docx']",
+                "a[href*='.xls']",
+                "a[href*='.xlsx']",
+                "a[href*='.zip']",
+                "a[href*='.rar']",
+            ]
+
+            for selector in attachment_selectors:
+                try:
+                    for link in scope.locator(selector).all():
+                        try:
+                            if not link.is_visible():
                                 continue
-                    except Exception as e:
-                        self.logger.warning(f"Erro ao buscar anexos com seletor {selector} para download: {str(e)}")
-                        continue
-                        
-        except Exception as e:
-            self.logger.error(f"Erro ao fazer download dos anexos do item {index + 1}: {str(e)}")
+                            href = link.get_attribute("href")
+                            if not href:
+                                continue
+                            text = (link.text_content() or "").strip()
+                            results.append((href, text))
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            return results
+        except Exception:
+            return results
+
+    def _choose_attachment_filename(self, text: str, href: str) -> Optional[str]:
+        """Escolhe um nome de arquivo confiável para salvar um anexo."""
+        try:
+            text_clean = re.sub(r'\s+', ' ', (text or "").strip())
+
+            # Remove query/fragment para extrair nome do path
+            href_base = (href or "").split("?", 1)[0].split("#", 1)[0]
+            href_name = Path(href_base).name.strip()
+
+            generic_texts = {
+                "anexos", "attachments", "attachment", "chment",
+                "download", "arquivo", "file", "documento",
+                "clique aqui", "open", "abrir",
+            }
+
+            # Se o texto é um nome útil (não URL e não genérico), usa ele
+            if text_clean and not self._is_url_text(text_clean):
+                if text_clean.lower() not in generic_texts:
+                    return text_clean
+
+            # Caso contrário, tenta derivar do href
+            if href_name:
+                return href_name
+
+            return None
+        except Exception:
+            return None
     
     def _download_file(self, url: str, filename: str) -> Path:
         """Baixa o arquivo do anexo e salva na pasta da cotação"""
         try:
-            # Se a URL for relativa, torna absoluta
-            if url.startswith('/'):
-                url = f"https://vale.coupahost.com{url}"
-            
-            self.logger.info(f"Fazendo download de: {url}")
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            
+            # Resolve URL absoluta usando a URL atual da página (cobre FERROSOS e METALS)
+            from urllib.parse import urljoin
+            absolute_url = urljoin(self.page.url, url)
+
+            self.logger.info(f"Fazendo download de: {absolute_url}")
+
+            # Usa request autenticado do Playwright (leva cookies/tokens da sessão)
+            api_response = self.page.request.get(absolute_url, timeout=30_000)
+            if not api_response.ok:
+                self.logger.warning(f"Falha HTTP ao baixar {absolute_url}: status={api_response.status}")
+                return None
+
+            content = api_response.body()
+
             safe_filename = self._sanitize_filename(filename)
             file_path = self.anexos_dir / safe_filename
-            
-            # Cria diretório se não existir
+
+            # Cria diretório somente quando vai salvar (evita pastas sem anexos)
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             with open(file_path, 'wb') as f:
-                f.write(response.content)
-            
+                f.write(content)
+
             self.logger.info(f"Arquivo salvo em: {file_path}")
             return file_path
             
@@ -1373,7 +1430,7 @@ class DataExporter:
         self.logger = LoggerConfig.setup_logger(self.__class__.__name__)
         self.duplicate_processor = DuplicateProcessor()
     
-    def export_to_excel(self, data: List[Dict[str, str]], filename: str) -> bool:
+    def export_to_excel(self, data: List[Dict[str, str]], filename: str, export_metadata: Optional[ExportMetadata] = None) -> bool:
         """Exporta dados para Excel (.xlsx) usando openpyxl puro com formatação adequada"""
         if not data:
             return False
@@ -1388,6 +1445,13 @@ class DataExporter:
             wb = Workbook()
             ws = wb.active
             ws.title = "Cotações"
+            # Nomeia a aba com a fonte (quando disponível) para facilitar identificação no Excel
+            if export_metadata:
+                source_label = "METALS" if export_metadata.source == CouperSource.METALS else "FERROSOS"
+                sheet_title = f"Cotações - {source_label}"
+                # Excel limita o título a 31 chars e proíbe alguns caracteres
+                sheet_title = re.sub(r'[\[\]\:\*\?\/\\]', '-', sheet_title)[:31]
+                ws.title = sheet_title
             
             # Cabeçalho - ordena para que unidade apareça logo após quantidade
             headers = list(filtered_data[0].keys())
@@ -1408,6 +1472,31 @@ class DataExporter:
                 if col not in ordered_headers:
                     ordered_headers.append(col)
             headers = ordered_headers
+            
+            # Linha de metadados (login + fonte) para rastreabilidade
+            if export_metadata:
+                source_label = "METALS" if export_metadata.source == CouperSource.METALS else "FERROSOS"
+                username = (export_metadata.username or "").strip() or "<não informado>"
+                metadata_line = f"Fonte: {source_label} | Login: {username}"
+                
+                ws.append([metadata_line])
+                # Merge em todas as colunas da tabela
+                last_col_letter = get_column_letter(max(len(headers), 1))
+                ws.merge_cells(f"A1:{last_col_letter}1")
+                meta_cell = ws["A1"]
+                meta_cell.font = Font(bold=True, color="FFFFFF")
+                meta_cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+                meta_cell.border = Border(
+                    left=Side(style='thin'),
+                    right=Side(style='thin'),
+                    top=Side(style='thin'),
+                    bottom=Side(style='thin')
+                )
+                
+                # Linha em branco para separar visualmente do cabeçalho da tabela
+                ws.append([""] * len(headers))
+            
+            header_row_idx = ws.max_row + 1
             ws.append(headers)
             
             # Estilo para cabeçalho
@@ -1422,11 +1511,11 @@ class DataExporter:
             )
             
             # Aplica estilo ao cabeçalho
-            for cell in ws[1]:
+            for cell in ws[header_row_idx]:
                 cell.style = header_style
             
             # Dados com formatação
-            for row_idx, row_data in enumerate(filtered_data, start=2):
+            for row_idx, row_data in enumerate(filtered_data, start=header_row_idx + 1):
                 for col_idx, header in enumerate(headers, start=1):
                     cell = ws.cell(row=row_idx, column=col_idx)
                     value = row_data.get(header, "")
@@ -1443,7 +1532,7 @@ class DataExporter:
                     
                     # Aplica formatação baseada no tipo de campo
                     if self._is_numeric_field(header, value):
-                        converted_value = self._convert_to_excel_number(value)
+                        converted_value = self._convert_to_excel_number(header, value)
                         cell.value = converted_value
                         # Se retornou string (para preservar formato de milhares), usa formato texto
                         if isinstance(converted_value, str):
@@ -1466,14 +1555,19 @@ class DataExporter:
                     )
             
             # Ajusta largura das colunas
-            for col in ws.columns:
+            # Obs: com células mescladas (merge), algumas posições viram MergedCell e não expõem column_letter.
+            from openpyxl.cell.cell import MergedCell
+
+            for col_idx, col_cells in enumerate(ws.iter_cols(min_col=1, max_col=ws.max_column), start=1):
                 max_length = 0
-                col_letter = col[0].column_letter
-                for cell in col:
+                col_letter = get_column_letter(col_idx)
+                for cell in col_cells:
                     try:
-                        if cell.value:
+                        if isinstance(cell, MergedCell):
+                            continue
+                        if cell.value is not None and cell.value != "":
                             max_length = max(max_length, len(str(cell.value)))
-                    except:
+                    except Exception:
                         pass
                 ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 80)
             
@@ -1504,20 +1598,35 @@ class DataExporter:
         ]
         return header.lower() in date_headers and value.strip()
     
-    def _convert_to_excel_number(self, value: str):
+    def _convert_to_excel_number(self, header: str, value: str):
         """Converte string para número do Excel, incluindo NCM como inteiro"""
         try:
             # Se for NCM (formato 0000.00.00), remove pontos e converte para inteiro
             if re.match(r'^\d{4}\.\d{2}\.\d{2}$', value.strip()):
                 return int(value.replace('.', ''))
-            # Para outros números, remove caracteres não numéricos exceto ponto
-            clean_value = re.sub(r'[^\d\.]', '', value.strip())
+            
+            header_norm = (header or "").strip().lower()
+            raw = (value or "").strip()
+            
+            # Quantidade: normaliza milhar para vírgula (ex.: 1.000 -> 1,000)
+            # Observação: devolvemos string para manter exatamente o separador desejado.
+            if header_norm == "quantidade":
+                # Mantém apenas dígitos e separadores
+                numeric_like = re.sub(r"[^\d\.,]", "", raw)
+                
+                # Padrão de milhar: 1.234.567 ou 1,234,567 (sem decimais)
+                if re.match(r"^\d{1,3}([.,]\d{3})+$", numeric_like):
+                    as_int = int(re.sub(r"[^\d]", "", numeric_like))
+                    return f"{as_int:,}"
+                
+                # Só dígitos: se >= 1000, aplica agrupamento com vírgula
+                digits_only = re.sub(r"[^\d]", "", numeric_like)
+                if digits_only.isdigit() and len(digits_only) > 3:
+                    return f"{int(digits_only):,}"
+            
+            # Para outros números, remove caracteres não numéricos exceto ponto (decimal)
+            clean_value = re.sub(r'[^\d\.]', '', raw)
             if clean_value:
-                # Para quantidade, preserva o formato original se tiver ponto como separador de milhares
-                if '.' in clean_value and len(clean_value.split('.')[-1]) <= 3:
-                    # Se tem ponto e a parte após o ponto tem 3 dígitos ou menos, 
-                    # provavelmente é separador de milhares, não decimal
-                    return clean_value  # Retorna como string para preservar formato
                 return float(clean_value)
             return None
         except:
@@ -1788,8 +1897,12 @@ class QuoteCrawler:
                 # TERCEIRA FASE: Salva dados no Excel
                 if quotes_data and len(quotes_data) > 0:
                     self._update_status("💾 Salvando dados...")
-                    filename = self._generate_filename()
-                    success = self.data_exporter.export_to_excel(quotes_data, filename)
+                    filename = self._generate_filename(username)
+                    success = self.data_exporter.export_to_excel(
+                        quotes_data,
+                        filename,
+                        export_metadata=ExportMetadata(username=username, source=self.config.source)
+                    )
                     if success:
                         self._update_status(f"✅ Dados salvos em Excel! Total: {len(quotes_data)} itens")
                         return True
@@ -2482,11 +2595,12 @@ class QuoteCrawler:
             self.logger.error(f"Erro ao procurar botão 'Editar': {str(e)}")
             return False
     
-    def _generate_filename(self) -> str:
-        """Gera nome do arquivo com timestamp e plataforma"""
+    def _generate_filename(self, username: str = "") -> str:
+        """Gera nome do arquivo com timestamp, plataforma e login"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plataforma = "METALS" if self.config.source == CouperSource.METALS else "FERROSOS"
-        return f"dados_cotacoes_{plataforma}_{timestamp}.csv"
+        login_part = sanitize_filename_component(username)
+        return f"dados_cotacoes_{plataforma}_{login_part}_{timestamp}.csv"
 
     def _is_date_older_than_target(self, date_to_check: str, target_date: str) -> bool:
         """Verifica se uma data é inferior à data desejada (para otimizar busca em tabela ordenada)"""
@@ -2740,10 +2854,16 @@ class CrawlerGUI:
         cred_frame.columnconfigure(0, weight=1)
         ttk.Label(cred_frame, text="Usuário (e-mail):", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         self.username_var = tk.StringVar()
-        ttk.Entry(cred_frame, textvariable=self.username_var, style="TEntry").grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
-        ttk.Label(cred_frame, text="Senha:", style="Section.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 0))
+        self.username_entry = ttk.Entry(cred_frame, textvariable=self.username_var, style="TEntry")
+        self.username_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 2))
+
+        # Autocomplete (multiusuário): lista suspensa com contas salvas
+        self._setup_credentials_autocomplete(cred_frame)
+
+        ttk.Label(cred_frame, text="Senha:", style="Section.TLabel").grid(row=3, column=0, sticky="w", padx=8, pady=(0, 0))
         self.password_var = tk.StringVar()
-        ttk.Entry(cred_frame, textvariable=self.password_var, show="*", style="TEntry").grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.password_entry = ttk.Entry(cred_frame, textvariable=self.password_var, show="*", style="TEntry")
+        self.password_entry.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
         
         # Checkbox para lembrar credenciais
         self.remember_var = tk.BooleanVar(value=False)
@@ -2752,7 +2872,7 @@ class CrawlerGUI:
             text="Lembrar credenciais nesta máquina",
             variable=self.remember_var
         )
-        remember_checkbox.grid(row=4, column=0, sticky="w", padx=8, pady=(5, 0))
+        remember_checkbox.grid(row=5, column=0, sticky="w", padx=8, pady=(5, 0))
         
         # Botão para limpar credenciais salvas
         clear_credentials_btn = ttk.Button(
@@ -2760,7 +2880,7 @@ class CrawlerGUI:
             text="🗑️ Limpar credenciais salvas",
             command=self._clear_saved_credentials
         )
-        clear_credentials_btn.grid(row=5, column=0, sticky="w", padx=8, pady=(5, 8))
+        clear_credentials_btn.grid(row=6, column=0, sticky="w", padx=8, pady=(5, 8))
         
         # Carrega credenciais salvas após a UI estar totalmente renderizada
         # Usa after_idle para garantir que a UI está completamente inicializada
@@ -2907,7 +3027,14 @@ class CrawlerGUI:
             
             try:
                 filename = self._generate_filename()
-                success = self.data_exporter.export_to_excel(self.extracted_data, filename)
+                success = self.data_exporter.export_to_excel(
+                    self.extracted_data,
+                    filename,
+                    export_metadata=ExportMetadata(
+                        username=self.username_var.get() if hasattr(self, "username_var") else "",
+                        source=self.config.source if hasattr(self, "config") else CouperSource.FERROSOS
+                    )
+                )
                 
                 if success:
                     self.status_var.set(f"✅ Excel gerado com {len(self.extracted_data)} itens!")
@@ -2930,6 +3057,108 @@ class CrawlerGUI:
             self.root.update()
             time.sleep(2)
             self._show_error_and_close("Nenhum dado foi extraído antes de parar a execução.")
+
+    # ==========================
+    # Autocomplete de credenciais (multiusuário)
+    # ==========================
+
+    def _setup_credentials_autocomplete(self, cred_frame) -> None:
+        """Configura autocomplete de e-mail usando Entry + Listbox (dropdown)."""
+        # Listbox começa oculto; aparece conforme o usuário digita.
+        self._accounts_listbox = tk.Listbox(cred_frame, height=5)
+        self._accounts_listbox.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._accounts_listbox.grid_remove()
+
+        # Bindings para seleção
+        self._accounts_listbox.bind("<<ListboxSelect>>", self._on_account_selected)
+        self._accounts_listbox.bind("<Return>", self._on_account_selected)
+        self._accounts_listbox.bind("<Double-Button-1>", self._on_account_selected)
+        self._accounts_listbox.bind("<Escape>", lambda e: self._hide_account_suggestions())
+
+        # Bindings do Entry
+        if hasattr(self, "username_entry"):
+            self.username_entry.bind("<KeyRelease>", self._on_username_keyrelease)
+            self.username_entry.bind("<Down>", self._focus_account_suggestions)
+            self.username_entry.bind("<Escape>", lambda e: self._hide_account_suggestions())
+            self.username_entry.bind("<FocusOut>", lambda e: self.root.after(150, self._hide_account_suggestions))
+
+    def _on_username_keyrelease(self, event=None) -> None:
+        """Atualiza sugestões conforme o usuário digita."""
+        try:
+            # Ignora teclas de navegação comuns
+            if event and getattr(event, "keysym", "") in {"Down", "Up", "Return", "Escape"}:
+                return
+
+            prefix = (self.username_var.get() or "").strip()
+            if not prefix:
+                self._hide_account_suggestions()
+                return
+
+            if not getattr(self, "credentials_manager", None):
+                return
+
+            accounts = self.credentials_manager.list_accounts()
+            prefix_lower = prefix.lower()
+            matches = [a for a in accounts if a.lower().startswith(prefix_lower)]
+
+            if not matches:
+                self._hide_account_suggestions()
+                return
+
+            self._accounts_listbox.delete(0, tk.END)
+            for a in matches:
+                self._accounts_listbox.insert(tk.END, a)
+
+            # Mostra dropdown
+            self._accounts_listbox.grid()
+        except Exception:
+            # Não quebra a UI por falha de autocomplete
+            self._hide_account_suggestions()
+
+    def _focus_account_suggestions(self, event=None) -> None:
+        """Move foco para a lista de sugestões."""
+        try:
+            if self._accounts_listbox.winfo_ismapped() and self._accounts_listbox.size() > 0:
+                self._accounts_listbox.focus_set()
+                self._accounts_listbox.selection_clear(0, tk.END)
+                self._accounts_listbox.selection_set(0)
+                self._accounts_listbox.activate(0)
+        except Exception:
+            pass
+
+    def _on_account_selected(self, event=None) -> None:
+        """Seleciona um usuário da lista e autopreenche senha."""
+        try:
+            if not self._accounts_listbox.curselection():
+                return
+            idx = int(self._accounts_listbox.curselection()[0])
+            username = self._accounts_listbox.get(idx)
+
+            self.username_var.set(username)
+
+            if getattr(self, "credentials_manager", None):
+                cred = self.credentials_manager.load_account(username)
+                if cred and cred.password:
+                    self.password_var.set(cred.password)
+                    # UX: se está usando uma conta salva, marca lembrar
+                    if hasattr(self, "remember_var"):
+                        self.remember_var.set(True)
+
+            self._hide_account_suggestions()
+
+            # Devolve foco para senha para o usuário seguir
+            if hasattr(self, "password_entry"):
+                self.password_entry.focus_set()
+        except Exception:
+            self._hide_account_suggestions()
+
+    def _hide_account_suggestions(self) -> None:
+        """Oculta a lista de sugestões."""
+        try:
+            if hasattr(self, "_accounts_listbox") and self._accounts_listbox.winfo_ismapped():
+                self._accounts_listbox.grid_remove()
+        except Exception:
+            pass
     
     def _load_saved_credentials(self) -> None:
         """Carrega credenciais salvas se existirem"""
@@ -3085,7 +3314,8 @@ class CrawlerGUI:
         """Gera nome do arquivo baseado na data atual e plataforma"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plataforma = "METALS" if self.config.source == CouperSource.METALS else "FERROSOS"
-        return f"cotacoes_extraidas_{plataforma}_{timestamp}.xlsx"
+        login_part = sanitize_filename_component(self.username_var.get() if hasattr(self, "username_var") else "")
+        return f"cotacoes_extraidas_{plataforma}_{login_part}_{timestamp}.xlsx"
     
     def run(self) -> None:
         """Executa a aplicação"""
