@@ -614,7 +614,9 @@ class ItemDataExtractor:
             
             # Extrai quantidade e unidade separadamente
             quantidade_raw = self._extract_field("div.s-quantity span.s-value", index)
-            quantidade = convert_to_number(quantidade_raw)
+            # Não normaliza separadores aqui: pode vir com ',' (decimal) ou '.' (milhar).
+            # A conversão para número é feita na exportação para Excel com heurística segura.
+            quantidade = (quantidade_raw or "").strip()
             
             # Extrai unidade (pode estar em um span separado ou no mesmo elemento)
             unidade = self._extract_field("div.s-quantity span.s-unit", index)
@@ -1534,11 +1536,15 @@ class DataExporter:
                     if self._is_numeric_field(header, value):
                         converted_value = self._convert_to_excel_number(header, value)
                         cell.value = converted_value
-                        # Se retornou string (para preservar formato de milhares), usa formato texto
-                        if isinstance(converted_value, str):
-                            cell.number_format = '@'  # Formato texto
+                        # Ajusta formato numérico (preserva decimais quando necessário)
+                        if isinstance(converted_value, (int, float)):
+                            if isinstance(converted_value, float) and not float(converted_value).is_integer():
+                                cell.number_format = '#,##0.########'  # Até 8 casas sem truncar
+                            else:
+                                cell.number_format = '#,##0'  # Inteiro / sem casas decimais
                         else:
-                            cell.number_format = '#,##0'  # Sem casas decimais
+                            # Fallback: texto (evita Excel "adivinhar" e corromper)
+                            cell.number_format = '@'
                     elif self._is_date_field(header, value):
                         cell.value = self._convert_to_excel_date(value)
                         cell.number_format = 'dd/mm/yyyy'
@@ -1608,21 +1614,13 @@ class DataExporter:
             header_norm = (header or "").strip().lower()
             raw = (value or "").strip()
             
-            # Quantidade: normaliza milhar para vírgula (ex.: 1.000 -> 1,000)
-            # Observação: devolvemos string para manter exatamente o separador desejado.
+            # Quantidade: converte para número sem perder o "valor real".
+            # Regras/heurística:
+            # - "1.234,56" => pt-BR (ponto milhar + vírgula decimal)
+            # - Só "." => milhar apenas quando bater grupos de 3; senão, decimal (fallback)
+            # - Só "," => milhar apenas quando bater grupos de 3; senão, decimal
             if header_norm == "quantidade":
-                # Mantém apenas dígitos e separadores
-                numeric_like = re.sub(r"[^\d\.,]", "", raw)
-                
-                # Padrão de milhar: 1.234.567 ou 1,234,567 (sem decimais)
-                if re.match(r"^\d{1,3}([.,]\d{3})+$", numeric_like):
-                    as_int = int(re.sub(r"[^\d]", "", numeric_like))
-                    return f"{as_int:,}"
-                
-                # Só dígitos: se >= 1000, aplica agrupamento com vírgula
-                digits_only = re.sub(r"[^\d]", "", numeric_like)
-                if digits_only.isdigit() and len(digits_only) > 3:
-                    return f"{int(digits_only):,}"
+                return self._parse_quantity_to_number(raw)
             
             # Para outros números, remove caracteres não numéricos exceto ponto (decimal)
             clean_value = re.sub(r'[^\d\.]', '', raw)
@@ -1631,6 +1629,59 @@ class DataExporter:
             return None
         except:
             return None
+
+    def _parse_quantity_to_number(self, raw: str) -> Optional[float]:
+        """Converte quantidade para número usando heurística segura (milhar vs decimal)."""
+        if not raw:
+            return None
+
+        numeric_like = re.sub(r"[^\d\.,]", "", str(raw).strip())
+        if not numeric_like:
+            return None
+
+        has_dot = "." in numeric_like
+        has_comma = "," in numeric_like
+
+        # Ambos: assume pt-BR (1.234,56)
+        if has_dot and has_comma:
+            normalized = numeric_like.replace(".", "").replace(",", ".")
+            try:
+                return float(normalized)
+            except Exception:
+                return None
+
+        # Só vírgula: milhar se grupos de 3; senão decimal
+        if has_comma and not has_dot:
+            if re.match(r"^\d{1,3}(,\d{3})+$", numeric_like):
+                try:
+                    return float(int(numeric_like.replace(",", "")))
+                except Exception:
+                    return None
+            try:
+                return float(numeric_like.replace(",", "."))
+            except Exception:
+                return None
+
+        # Só ponto: milhar se grupos de 3; senão decimal (fallback)
+        if has_dot and not has_comma:
+            if re.match(r"^\d{1,3}(\.\d{3})+$", numeric_like):
+                try:
+                    return float(int(numeric_like.replace(".", "")))
+                except Exception:
+                    return None
+            try:
+                return float(numeric_like)
+            except Exception:
+                return None
+
+        # Só dígitos
+        if numeric_like.isdigit():
+            try:
+                return float(int(numeric_like))
+            except Exception:
+                return None
+
+        return None
     
     def _convert_to_excel_date(self, value: str):
         """Converte string de data para data do Excel"""
