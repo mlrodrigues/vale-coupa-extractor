@@ -42,26 +42,18 @@ python main_refactored.py
 
 ### Rodando Testes
 
-```bash
-# Testes do gerenciador de credenciais
-python test_credentials_manager.py
-```
+No momento o projeto não inclui um arquivo `test_credentials_manager.py` no repositório.
 
 ## Compilando para Executável (Windows)
 
-### Com PyInstaller
-
-```bash
-python build_exe.py
-```
-
-Ou para versão portátil:
+### Com PyInstaller (portátil)
 
 ```bash
 python build_exe_portable.py
 ```
 
 O executável será criado em `dist/ValeCoupaCrawler.exe`
+Observação: o script gera a versão portátil (`ValeCoupaCrawler_Portable.exe`).
 
 ## Estrutura do Projeto
 
@@ -69,14 +61,12 @@ O executável será criado em `dist/ValeCoupaCrawler.exe`
 vale-coupa-extractor/
 ├── main_refactored.py           # Aplicação principal
 ├── credentials_manager.py       # Gerenciador de credenciais
-├── test_credentials_manager.py  # Testes unitários
-├── build_exe.py                 # Script de compilação
+├── (sem testes no repo)         # Opcional
 ├── build_exe_portable.py        # Script compilação portátil
 ├── requirements.txt             # Dependências
 ├── README.md                     # Documentação do usuário
 ├── INSTALLATION.md              # Este arquivo
-├── CREDENTIALS_IMPLEMENTATION.md # Documentação técnica
-└── BUILD.md                     # Instruções de build
+└── ValeCoupaCrawler_Portable.spec # Spec do PyInstaller (portátil)
 ```
 
 ## Troubleshooting
@@ -170,7 +160,5 @@ set CREDMANAGER_CONFIG_DIR=C:\MyCredentials
 Se encontrar problemas:
 
 1. Verifique o arquivo `crawler.log` para erros detalhados
-2. Verifique o arquivo `credentials.log` para erros de credenciais
-3. Execute testes: `python test_credentials_manager.py`
-4. Consulte a documentação técnica: `CREDENTIALS_IMPLEMENTATION.md`
+2. Verifique o arquivo `credentials.log` para erros de credenciais (se habilitado)
 

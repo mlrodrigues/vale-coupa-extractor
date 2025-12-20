@@ -1,3 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Credentials (local)
+.credentials/
+*.key
+credentials.log
+
+# Logs
+*.log
+
+# Exports / user data
+anexos/
+downloads_anexos/
+*.xlsx
+*.csv
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+*.rar
+*** End Patch}评论 to=functions.apply_patch
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

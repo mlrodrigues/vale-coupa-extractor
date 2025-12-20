@@ -2,7 +2,7 @@
 
 ## O que é este aplicativo?
 
-O **Vale Coupa Extrator de Cotações** é um programa que automatiza a extração de dados de cotações da plataforma Vale Coupa. Em vez de você ter que copiar e colar cada item manualmente, o programa faz isso automaticamente e salva tudo em uma planilha Excel (arquivo CSV).
+O **Vale Coupa Extrator de Cotações** é um programa que automatiza a extração de dados de cotações da plataforma Vale Coupa. Em vez de você ter que copiar e colar cada item manualmente, o programa faz isso automaticamente e salva tudo em uma planilha Excel (`.xlsx`).
 
 ## 📋 O que você vai precisar
 
@@ -14,7 +14,7 @@ O **Vale Coupa Extrator de Cotações** é um programa que automatiza a extraç�
 ## 🚀 Como usar o aplicativo
 
 ### 1. Executar o programa
-- Localize o arquivo `ValeCoupaCrawler_Headless.exe` (ou nome similar)
+- Localize o arquivo `ValeCoupaCrawler_Portable.exe` (ou nome similar)
 - **Dê um duplo-clique** no arquivo para abrir o programa
 - Aguarde alguns segundos para o programa carregar
 
@@ -51,8 +51,8 @@ Na parte inferior da tela, você verá mensagens mostrando o que está acontecen
 
 ## 📊 Resultado final
 
-Quando o programa terminar, você encontrará um arquivo CSV na **mesma pasta do programa** com nome parecido com:
-`dados_cotacoes_20241225_143022.csv`
+Quando o programa terminar, você encontrará um arquivo Excel (`.xlsx`) na **mesma pasta do programa** com nome parecido com:
+`dados_cotacoes_FERROSOS_kennedy.correa_20251216_195341.xlsx`
 
 Este arquivo pode ser aberto no **Excel** ou **Google Sheets** e contém todas as informações extraídas:
 - Evento (número da cotação)
@@ -131,13 +131,13 @@ R: Sim! Basta **desmarcar** a opção "Lembrar credenciais nesta máquina" e sua
 
 ## 📝 Exemplo de uso completo
 
-1. Duplo-clique no `ValeCoupaCrawler_Headless.exe`
+1. Duplo-clique no `ValeCoupaCrawler_Portable.exe`
 2. Digite seu usuário: `joao.silva@empresa.com`
 3. Digite sua senha: `MinhaSenh@123`
 4. Digite a data: `15/01/25`
 5. Clique em "🔥 EXTRAIR COTAÇÕES"
 6. Aguarde as mensagens de progresso
-7. Quando aparecer "✅ Extração concluída!", procure o arquivo CSV na pasta
+7. Quando aparecer "✅ Extração concluída!", procure o arquivo Excel (`.xlsx`) na pasta
 8. Abra o arquivo no Excel para ver os dados
 
 ## 🆘 Suporte

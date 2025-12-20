@@ -2934,7 +2934,7 @@ class CrawlerGUI:
         status_card.pack(padx=20, pady=10, fill="x")
         self.status_var = tk.StringVar(value="Pronto para extrair cotações")
         ttk.Label(status_card, textvariable=self.status_var, foreground="#22bb55", font=("Segoe UI", 11, "bold"), background="#fff").pack(anchor="w", padx=8, pady=(8, 5))
-        ttk.Label(status_card, text="Os dados serão salvos em CSV na pasta do programa. Anexos em 'downloads_anexos'.", font=("Segoe UI", 8), background="#fff").pack(anchor="w", padx=8, pady=(0, 8))
+        ttk.Label(status_card, text="Os dados serão salvos em Excel (.xlsx) na pasta do programa. Anexos em 'anexos/<numero_evento>/'.", font=("Segoe UI", 8), background="#fff").pack(anchor="w", padx=8, pady=(0, 8))
     
     def _create_action_section(self, parent) -> None:
         """Cria seção de ações"""
